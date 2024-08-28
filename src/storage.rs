@@ -6,21 +6,20 @@ pub mod btree {
     use std::marker::Sized;
 
     // const PAGE_SIZE: usize = 16384;
-    // B = floor( (PAGE_SIZE - header_size)/max_row_size )
 
     // Key and Val are trait aliases
-    pub trait Key: Ord + Clone + Copy + fmt::Debug
+    pub trait Key: Ord + Clone + fmt::Debug
     where
         Self: Sized,
     {
     }
-    pub trait Val: Clone + Copy + fmt::Debug
+    pub trait Val: Clone + fmt::Debug
     where
         Self: Sized,
     {
     }
-    impl<T> Key for T where T: Ord + Clone + Copy + fmt::Debug {}
-    impl<T> Val for T where T: Clone + Copy + fmt::Debug {}
+    impl<T> Key for T where T: Ord + Clone + fmt::Debug {}
+    impl<T> Val for T where T: Clone + fmt::Debug {}
 
     // TODO: use enum for leaf page and interior page
     #[derive(Debug, Clone)]
@@ -46,6 +45,7 @@ pub mod btree {
         n_deleted: usize,
         n_entries: usize,
     }
+    // TODO: use "Pager" that can get pages from disk
 
     impl<K: Key, V: Val> fmt::Display for BTree<K, V> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,18 +100,19 @@ pub mod btree {
             }
         }
 
-        pub fn from_sorted(&mut self, vals: &Vec<V>) {
-            // TODO: efficient bulk loading
-        }
+        // pub fn from_sorted(&mut self, vals: &Vec<V>) {
+        // TODO: efficient bulk loading
+        // }
 
         // Rebuild the tree to remove soft deleted keys.
         pub fn rebuild(&mut self) {
-            // find min
             let mut id = self.root_id;
             for _ in 0..self.depth {
                 let page = &self.pages[id as usize];
                 id = page.children[0];
             }
+
+            // traverse leaf pages to collect kv's
             let mut keys: Vec<K> = Vec::with_capacity(self.n_entries);
             let mut vals: Vec<V> = Vec::with_capacity(self.n_entries);
             let max_pages = self.pages.len();
@@ -153,7 +154,7 @@ pub mod btree {
 
         // Return the value associated with key, or None if it doesn't exist.
         // If there are multiple values associated with the key, any can be returned.
-        pub fn find(&self, key: &K) -> Option<V> where {
+        pub fn find(&self, key: &K) -> Option<V> {
             let id = self.find_leaf(key);
             let leaf = &self.pages[id as usize];
             match leaf.keys.binary_search(key) {
@@ -166,6 +167,38 @@ pub mod btree {
                 }
                 Err(_) => None,
             }
+        }
+
+        // Find key-value pairs where the min <= key <= max.
+        pub fn find_range(&self, min: &K, max: &K) -> Vec<(K, V)> {
+            let mut kvs = vec![];
+            let mut id = self.find_leaf(min);
+            let mut leaf = &self.pages[id as usize];
+            let mut idx = match leaf.keys.binary_search(min) {
+                Ok(i) => i,
+                Err(i) => i,
+            };
+            'outer: loop {
+                for i in idx..leaf.vals.len() {
+                    if leaf.keys[i] > *max {
+                        break 'outer;
+                    }
+                    if !leaf.deleted[i] {
+                        kvs.push((leaf.keys[i].clone(), leaf.vals[i].clone()));
+                    }
+                }
+                match leaf.sibling {
+                    Some(i) => {
+                        id = i;
+                    }
+                    None => {
+                        break;
+                    }
+                }
+                leaf = &self.pages[id as usize];
+                idx = 0;
+            }
+            kvs
         }
 
         pub fn insert(&mut self, key: K, val: V) {
@@ -459,5 +492,26 @@ mod tests {
         assert_eq!(bt.find(&10), Some(100));
         assert_eq!(bt.find(&3), Some(333));
         assert_eq!(bt.find(&6), Some(66));
+    }
+
+    #[test]
+    fn test_find_range() {
+        let mut bt: BTree<i32, i32> = BTree::new(33);
+        for i in (0..10000).step_by(3) {
+            bt.insert(i as i32, 3 * i as i32);
+        }
+
+        let min = 51;
+        let max = 300;
+        let kvs = bt.find_range(&min, &max);
+        assert_eq!(51, kvs.first().unwrap().0);
+        assert_eq!(300, kvs.last().unwrap().0);
+        assert_eq!(kvs.len(), ((max - min) / 3 + 1) as usize);
+
+        for (k, v) in kvs.into_iter() {
+            assert!(k >= 51);
+            assert!(300 >= k);
+            assert_eq!(v, 3 * k);
+        }
     }
 }

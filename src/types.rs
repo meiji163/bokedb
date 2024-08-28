@@ -1,6 +1,7 @@
 pub mod values {
     use anyhow;
-    use std::cmp::{self, Ordering};
+    use std::fmt;
+    //use std::cmp::{self, Ordering};
     //const MAX_COLUMNS: usize = 255;
 
     #[derive(Debug, Eq, PartialEq, Clone)]
@@ -58,13 +59,14 @@ pub mod values {
         }
     }
 
-    // impl Ord for Value {
-    //     fn cmp(&self, other: &Self) -> Ordering {
-    //         match self {
-
-    //         }
-    //     }
-    // }
+    impl fmt::Display for Value {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Value::Int(n) => n.fmt(f),
+                Value::VarChar(vc) => vc.val.fmt(f),
+            }
+        }
+    }
 
     pub type Row = Vec<Value>;
 
