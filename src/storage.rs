@@ -4,8 +4,6 @@ pub mod btree {
     use std::fmt;
     use std::marker::Sized;
 
-    // const PAGE_SIZE: usize = 16384;
-
     // Key and Val are trait aliases
     pub trait Key: Ord + Clone + fmt::Debug
     where
@@ -77,8 +75,8 @@ pub mod btree {
 
     impl<K: Key, V: Val> BTree<K, V> {
         pub fn new(b: usize) -> BTree<K, V> {
-            // assert_eq!(b % 2, 1);
-            // assert!(b > 2);
+            assert_eq!(b % 2, 1);
+            assert!(b > 2);
 
             let pages = vec![Page {
                 id: 0,
@@ -241,11 +239,14 @@ pub mod btree {
 
             // split page and propagate the split if necessary
             if needs_split {
-                // TODO: try to overflow to sibling first
+                // try to overflow to sibling first
+                let mut par = visited.pop();
+                if let Ok(()) = self.overflow_to_sibling(id, par) {
+                    return;
+                }
 
                 let max_splits = self.depth.clone() + 1;
                 for _ in 0..max_splits {
-                    let par = visited.pop();
                     let split_more = self.split_page(id, par);
                     if !split_more {
                         break;
@@ -254,8 +255,70 @@ pub mod btree {
                         // is constructed when par == None.
                         id = par.unwrap();
                     }
+                    par = visited.pop();
                 }
             }
+        }
+
+        // Attempt to overflow keys & vals of the leaf page to its right sibling.
+        // Returns Err if overflow not possible.
+        fn overflow_to_sibling(
+            &mut self,
+            page_id: u32,
+            parent_id: Option<u32>,
+        ) -> Result<(), &'static str> {
+            let sibling_id = self.pages[page_id as usize].sibling;
+            if sibling_id.is_none() || parent_id.is_none() {
+                return Err("no sibling or no parent");
+            }
+            let sib_id = sibling_id.unwrap() as usize;
+            let par_id = parent_id.unwrap() as usize;
+
+            // how many keys to overflow from page?
+            let mov = {
+                let page = &self.pages[page_id as usize];
+                let p = page.keys.len();
+                let sib = &self.pages[sib_id];
+                let s = sib.keys.len();
+
+                // p > s + 1 ensures we can move at least one key to sibling
+                // p + s < b ensures we don't underflow
+                if s >= self.b || p <= s + 1 || p + s < self.b {
+                    return Err("sibling full, not attempting overflow");
+                }
+                (p - s) / 2
+            };
+
+            let (ks, vs, ds) = {
+                let page = &mut self.pages[page_id as usize];
+                let p = page.keys.len();
+                let ks: Vec<K> = page.keys.drain((p - 1 - mov)..).collect();
+                let vs: Vec<V> = page.vals.drain((p - 1 - mov)..).collect();
+                let ds: Vec<bool> = page.deleted.drain((p - 1 - mov)..).collect();
+                (ks, vs, ds)
+            };
+            // update parent key
+            {
+                let max_key = self.pages[page_id as usize].keys.last().unwrap().clone();
+                let parent = &mut self.pages[par_id];
+                let idx = parent.find(&max_key);
+                parent.keys[idx] = max_key;
+            }
+            // move data to sibling
+            {
+                let sib = &mut self.pages[sib_id];
+                // TODO: Vec::insert is inefficient
+                for k in ks.into_iter().rev() {
+                    sib.keys.insert(0, k);
+                }
+                for v in vs.into_iter().rev() {
+                    sib.vals.insert(0, v);
+                }
+                for d in ds.into_iter().rev() {
+                    sib.deleted.insert(0, d);
+                }
+            }
+            Ok(())
         }
 
         // Split the given page by promoting a key to the next level of the tree,
@@ -359,7 +422,6 @@ pub mod btree {
                     }
                 }
             }
-
             self.n_deleted += n_deleted;
             if n_deleted > 0 {
                 Ok(n_deleted)
