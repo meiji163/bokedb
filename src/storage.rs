@@ -2,7 +2,6 @@ pub mod btree {
     use std::cmp::Ord;
     use std::collections::VecDeque;
     use std::fmt;
-    use std::io;
     use std::marker::Sized;
 
     // const PAGE_SIZE: usize = 16384;
@@ -78,8 +77,9 @@ pub mod btree {
 
     impl<K: Key, V: Val> BTree<K, V> {
         pub fn new(b: usize) -> BTree<K, V> {
-            assert_eq!(b % 2, 1);
-            assert!(b > 2);
+            // assert_eq!(b % 2, 1);
+            // assert!(b > 2);
+
             let pages = vec![Page {
                 id: 0,
                 keys: vec![],
@@ -213,22 +213,36 @@ pub mod btree {
             }
 
             let mut needs_split = false;
-            // insert key-val in the leaf page
             {
+                // insert key-val in the leaf page
                 let leaf = &mut self.pages[id as usize];
-
-                // duplicate keys are allowed
                 let idx = leaf.keys.binary_search(&key).unwrap_or_else(|x| x);
                 leaf.keys.insert(idx, key);
                 leaf.vals.insert(idx, val);
                 leaf.deleted.insert(idx, false);
+
+                // since we inserted one entry, we can garbage collect one deleted entry
+                let mut del_idx = leaf
+                    .deleted
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &b)| b)
+                    .map(|(i, _)| i);
+                if let Some(i) = del_idx.next() {
+                    leaf.deleted.remove(i);
+                    leaf.keys.remove(i);
+                    leaf.vals.remove(i);
+                }
+
                 if leaf.keys.len() >= self.b {
                     needs_split = true;
                 }
             }
 
-            // propagate the split if necessary
+            // split page and propagate the split if necessary
             if needs_split {
+                // TODO: try to overflow to sibling first
+
                 let max_splits = self.depth.clone() + 1;
                 for _ in 0..max_splits {
                     let par = visited.pop();
@@ -321,7 +335,7 @@ pub mod btree {
         }
 
         // delete marks entries associatied with key as deleted
-        pub fn delete(&mut self, key: &K) -> io::Result<usize> {
+        pub fn delete(&mut self, key: &K) -> Result<usize, &'static str> {
             let mut id = self.find_leaf(key);
             let mut n_deleted = 0;
 
@@ -350,9 +364,7 @@ pub mod btree {
             if n_deleted > 0 {
                 Ok(n_deleted)
             } else {
-                let err =
-                    io::Error::new(io::ErrorKind::NotFound, format!("key {:?} not found", key));
-                Err(err)
+                Err("key not found")
             }
         }
 

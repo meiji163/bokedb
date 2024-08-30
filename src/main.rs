@@ -14,8 +14,6 @@ enum MetaCommand {
     Exit,
 }
 
-// simple statements
-
 fn parse_meta(cmd: &str) -> Option<MetaCommand> {
     match cmd {
         ".exit" => Some(MetaCommand::Exit),
