@@ -54,7 +54,7 @@ fn do_select(bt: &BTree<i32, [Value; 2]>, stmt: Statement<i32, [Value; 2]>) -> V
 // insert 1 'meiji163' 'meiji163@github.com'
 
 fn main() -> io::Result<()> {
-    let mut bt: btree::BTree<i32, [Value; 2]> = btree::BTree::new(101);
+    let mut bt: btree::BTree<i32, [Value; 2]> = btree::BTree::new(101, true);
 
     let mut input_buf = String::with_capacity(4096);
     let mut stdin = io::stdin().lock();
@@ -81,9 +81,10 @@ fn main() -> io::Result<()> {
                             println!("{0: <5} | {1: <32} | {2: <32}", r[0], r[1], r[2]);
                         }
                     }
-                    Statement::Insert((k, v)) => {
-                        bt.insert(k, v);
-                    }
+                    Statement::Insert((k, v)) => match bt.insert(k, v) {
+                        Ok(()) => println!("OK"),
+                        Err(err) => println!("Error: {}", err),
+                    },
                     Statement::Delete(k) => match bt.delete(&k) {
                         Ok(n_rows) => {
                             println!("{} rows deleted", n_rows);

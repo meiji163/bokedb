@@ -35,6 +35,7 @@ pub mod btree {
     #[derive(Debug, Clone)]
     pub struct BTree<K: Key, V: Val> {
         b: usize,
+        is_unique: bool,
         depth: usize,
         root_id: u32,
         next_id: u32,
@@ -44,6 +45,26 @@ pub mod btree {
     }
     // TODO: use "Pager" that can get pages from disk
 
+    /// ------------------- Error Types -------------------
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct KeyNotFoundError;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DuplicateKeyError;
+
+    impl fmt::Display for KeyNotFoundError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "key not found")
+        }
+    }
+
+    impl fmt::Display for DuplicateKeyError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "duplicate key")
+        }
+    }
+
+    /// ------------------- BTree Implementation -------------------
     impl<K: Key, V: Val> fmt::Display for BTree<K, V> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let vecs = self.traverse();
@@ -74,7 +95,7 @@ pub mod btree {
     }
 
     impl<K: Key, V: Val> BTree<K, V> {
-        pub fn new(b: usize) -> BTree<K, V> {
+        pub fn new(b: usize, is_unique: bool) -> BTree<K, V> {
             assert_eq!(b % 2, 1);
             assert!(b > 2);
 
@@ -90,6 +111,7 @@ pub mod btree {
             BTree {
                 b: b,
                 pages: pages,
+                is_unique: is_unique,
                 depth: 0,
                 root_id: 0,
                 next_id: 1,
@@ -139,14 +161,14 @@ pub mod btree {
             }
 
             // reset tree
-            self.pages = Self::new(self.b).pages;
+            self.pages = Self::new(self.b, self.is_unique).pages;
             self.depth = 0;
             self.root_id = 0;
             self.next_id = 1;
             self.n_deleted = 0;
             self.n_entries = 0;
             for (k, v) in keys.into_iter().zip(vals.into_iter()) {
-                self.insert(k, v);
+                let _ = self.insert(k, v);
             }
         }
 
@@ -199,7 +221,8 @@ pub mod btree {
             kvs
         }
 
-        pub fn insert(&mut self, key: K, val: V) {
+        // Insert a key-val pair into the tree.
+        pub fn insert(&mut self, key: K, val: V) -> Result<(), DuplicateKeyError> {
             self.n_entries += 1;
             let mut id = self.root_id;
             let mut visited = vec![];
@@ -212,14 +235,27 @@ pub mod btree {
 
             let mut needs_split = false;
             {
-                // insert key-val in the leaf page
+                // attempt insert key-val in the leaf page
                 let leaf = &mut self.pages[id as usize];
-                let idx = leaf.keys.binary_search(&key).unwrap_or_else(|x| x);
-                leaf.keys.insert(idx, key);
-                leaf.vals.insert(idx, val);
-                leaf.deleted.insert(idx, false);
+                let search = leaf.keys.binary_search(&key);
+                let idx = search.unwrap_or_else(|x| x);
+                if search.is_err() || (search.is_ok() && !self.is_unique) {
+                    leaf.keys.insert(idx, key.clone());
+                    leaf.vals.insert(idx, val);
+                    leaf.deleted.insert(idx, false);
+                } else {
+                    // duplicate key on a unique tree:
+                    // try to replace a deleted entry, otherwise error
+                    if leaf.deleted[idx] {
+                        leaf.vals[idx] = val;
+                        leaf.deleted[idx] = false;
+                        return Ok(());
+                    } else {
+                        return Err(DuplicateKeyError);
+                    }
+                }
 
-                // since we inserted one entry, we can garbage collect one deleted entry
+                // since we inserted one entry, we can garbage collect one entry
                 let mut del_idx = leaf
                     .deleted
                     .iter()
@@ -239,25 +275,27 @@ pub mod btree {
 
             // split page and propagate the split if necessary
             if needs_split {
-                // try to overflow to sibling first
                 let mut par = visited.pop();
+                // try to overflow to sibling first
+                // otherwise split the page
                 if let Ok(()) = self.overflow_to_sibling(id, par) {
-                    return;
-                }
-
-                let max_splits = self.depth.clone() + 1;
-                for _ in 0..max_splits {
-                    let split_more = self.split_page(id, par);
-                    if !split_more {
-                        break;
-                    } else {
-                        // par != None here since a new root page
-                        // is constructed when par == None.
-                        id = par.unwrap();
+                    return Ok(());
+                } else {
+                    let max_splits = self.depth.clone() + 1;
+                    for _ in 0..max_splits {
+                        let split_more = self.split_page(id, par);
+                        if !split_more {
+                            break;
+                        } else {
+                            // par != None here since a new root page
+                            // is constructed when par == None.
+                            id = par.unwrap();
+                        }
+                        par = visited.pop();
                     }
-                    par = visited.pop();
                 }
             }
+            Ok(())
         }
 
         // Attempt to overflow keys & vals of the leaf page to its right sibling.
@@ -288,7 +326,7 @@ pub mod btree {
                 }
                 (p - s) / 2
             };
-
+            // drain data from page
             let (ks, vs, ds) = {
                 let page = &mut self.pages[page_id as usize];
                 let p = page.keys.len();
@@ -322,7 +360,7 @@ pub mod btree {
         }
 
         // Split the given page by promoting a key to the next level of the tree,
-        // The key is promoted to the parent page if it exists, or a new root page otherwise.
+        // The key is promoted to the parent page if it exists, or to a new root page otherwise.
         // Returns true if a further split of the parent page is necessary.
         fn split_page(&mut self, page_id: u32, parent_id: Option<u32>) -> bool {
             let page = &mut self.pages[page_id as usize];
@@ -398,7 +436,7 @@ pub mod btree {
         }
 
         // delete marks entries associatied with key as deleted
-        pub fn delete(&mut self, key: &K) -> Result<usize, &'static str> {
+        pub fn delete(&mut self, key: &K) -> Result<usize, KeyNotFoundError> {
             let mut id = self.find_leaf(key);
             let mut n_deleted = 0;
 
@@ -426,7 +464,7 @@ pub mod btree {
             if n_deleted > 0 {
                 Ok(n_deleted)
             } else {
-                Err("key not found")
+                Err(KeyNotFoundError)
             }
         }
 
@@ -470,12 +508,12 @@ mod tests {
 
     #[test]
     fn test_insert_no_split() {
-        let mut bt: BTree<i32, i32> = BTree::new(27);
-        bt.insert(5, 50);
-        bt.insert(6, 60);
-        bt.insert(7, -70);
-        bt.insert(7, 70);
-        bt.insert(8, 80);
+        let mut bt: BTree<i32, i32> = BTree::new(27, false);
+        let kvs = [(5, 50), (6, 60), (7, -70), (7, 70), (8, 80)];
+        for (k, v) in kvs.into_iter() {
+            let err = bt.insert(k, v);
+            assert!(err.is_ok());
+        }
         assert_eq!(bt.find(&5), Some(50));
         assert_eq!(bt.find(&6), Some(60));
         assert_eq!(bt.find(&8), Some(80));
@@ -483,14 +521,12 @@ mod tests {
 
     #[test]
     fn test_insert_split() {
-        let mut bt: BTree<i32, i32> = BTree::new(3);
-        bt.insert(5, 55);
-        bt.insert(6, 66);
-        bt.insert(7, 77);
-        bt.insert(9, 99);
-        bt.insert(10, 100);
-        bt.insert(8, 88);
-        println!("{}", bt);
+        let mut bt: BTree<i32, i32> = BTree::new(3, true);
+        let kvs = [(5, 55), (6, 66), (7, 77), (8, 88), (9, 99), (10, 100)];
+        for (k, v) in kvs.into_iter() {
+            let err = bt.insert(k, v);
+            assert!(err.is_ok());
+        }
 
         assert_eq!(bt.find(&5), Some(55));
         assert_eq!(bt.find(&6), Some(66));
@@ -503,7 +539,7 @@ mod tests {
     #[test]
     fn test_insert_rand() {
         let mut rng = rand::thread_rng();
-        let mut bt: BTree<i32, i32> = BTree::new(133);
+        let mut bt: BTree<i32, i32> = BTree::new(133, false);
 
         let mut keys: Vec<i32> = (0..10000)
             .map(|_| {
@@ -516,9 +552,9 @@ mod tests {
         for &k in keys.iter() {
             let val: i32 = rng.gen();
             vals.push(val);
-            bt.insert(k, val);
+            let err = bt.insert(k, val);
+            assert!(err.is_ok());
         }
-
         for (k, v) in keys.iter().zip(vals) {
             assert_eq!(bt.find(k), Some(v));
         }
@@ -526,13 +562,12 @@ mod tests {
 
     #[test]
     fn test_delete_one() {
-        let mut bt: BTree<i32, i32> = BTree::new(3);
-        bt.insert(5, 55);
-        bt.insert(6, 66);
-        bt.insert(7, 77);
-        bt.insert(9, 99);
-        bt.insert(10, 100);
-        bt.insert(3, 333);
+        let mut bt: BTree<i32, i32> = BTree::new(3, true);
+        let kvs = [(3, 333), (5, 55), (6, 66), (7, 77), (9, 99), (10, 100)];
+        for (k, v) in kvs.into_iter() {
+            let err = bt.insert(k, v);
+            assert!(err.is_ok());
+        }
 
         assert_eq!(bt.find(&5), Some(55));
         let err = bt.delete(&5);
@@ -542,21 +577,36 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild() {
-        let mut bt: BTree<i32, i32> = BTree::new(3);
-        bt.insert(5, 55);
-        bt.insert(6, 66);
-        bt.insert(7, 77);
-        bt.insert(9, 99);
-        bt.insert(9, 999);
-        bt.insert(9, 9999);
-        bt.insert(10, 100);
-        bt.insert(3, 333);
+    fn test_duplicate_key() {
+        let mut bt: BTree<i32, i32> = BTree::new(5, true);
+        assert!(bt.insert(5, 55).is_ok());
+        let err = bt.insert(5, 555);
+        assert_eq!(err, Err(DuplicateKeyError));
 
+        assert!(bt.delete(&5).is_ok());
+        assert!(bt.insert(5, 555).is_ok());
+    }
+
+    #[test]
+    fn test_rebuild() {
+        let mut bt: BTree<i32, i32> = BTree::new(3, false);
+        let kvs = [
+            (5, 55),
+            (6, 66),
+            (7, 77),
+            (9, 99),
+            (9, 999),
+            (9, 9999),
+            (10, 100),
+            (3, 333),
+        ];
+        for (k, v) in kvs.into_iter() {
+            let err = bt.insert(k, v);
+            assert!(err.is_ok());
+        }
         assert!(bt.delete(&5).is_ok());
         assert!(bt.delete(&9).is_ok());
         assert!(bt.delete(&7).is_ok());
-        println!("{}", bt);
 
         bt.rebuild();
 
@@ -570,9 +620,10 @@ mod tests {
 
     #[test]
     fn test_find_range() {
-        let mut bt: BTree<i32, i32> = BTree::new(33);
+        let mut bt: BTree<i32, i32> = BTree::new(33, true);
         for i in (0..10000).step_by(3) {
-            bt.insert(i as i32, 3 * i as i32);
+            let err = bt.insert(i as i32, 3 * i as i32);
+            assert!(err.is_ok());
         }
 
         let min = 51;
