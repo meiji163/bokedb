@@ -4,7 +4,7 @@ pub mod btree {
     use std::fmt;
     use std::marker::Sized;
 
-    // Key and Val are trait aliases
+    /// Key and Val are trait aliases
     pub trait Key: Ord + Clone + fmt::Debug
     where
         Self: Sized,
@@ -18,39 +18,15 @@ pub mod btree {
     impl<T> Key for T where T: Ord + Clone + fmt::Debug {}
     impl<T> Val for T where T: Clone + fmt::Debug {}
 
-    // TODO: use enum for leaf page and interior page
-    #[derive(Debug, Clone)]
-    pub struct Page<K: Key, V: Val> {
-        id: u32,
-        deleted: Vec<bool>,   // soft delete info for leaf pages
-        keys: Vec<K>,         // keys for interior and leaf pages
-        vals: Vec<V>,         // vals corresponding to keys for leaf pages
-        children: Vec<u32>,   // child page IDs for interior pages
-        sibling: Option<u32>, // right sibling page ID for leaf pages
-        is_leaf: bool,
-    }
-
-    // BTree implements an in-memory B+Tree.
-    // Each page has at most b children, where b is odd.
-    #[derive(Debug, Clone)]
-    pub struct BTree<K: Key, V: Val> {
-        b: usize,
-        is_unique: bool,
-        depth: usize,
-        root_id: u32,
-        next_id: u32,
-        pages: Vec<Page<K, V>>,
-        n_deleted: usize,
-        n_entries: usize,
-    }
-    // TODO: use "Pager" that can get pages from disk
-
     /// ------------------- Error Types -------------------
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct KeyNotFoundError;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct DuplicateKeyError;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PageNotFoundError;
 
     impl fmt::Display for KeyNotFoundError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -64,18 +40,67 @@ pub mod btree {
         }
     }
 
-    /// ------------------- BTree Implementation -------------------
-    impl<K: Key, V: Val> fmt::Display for BTree<K, V> {
+    impl fmt::Display for PageNotFoundError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let vecs = self.traverse();
-            for (l, ids) in vecs.iter().enumerate() {
-                f.write_fmt(format_args!("LEVEL {:?}\n", l))?;
+            write!(f, "page not found")
+        }
+    }
 
-                for &id in ids.iter() {
-                    f.write_fmt(format_args!("\t{:?}\n", self.pages[id as usize]))?;
+    pub const PAGE_SIZE: usize = 65536;
+
+    /// Page is a BTree page, which can hold keys or key-vals
+    #[derive(Debug, Clone)]
+    pub struct Page<K: Key, V: Val> {
+        id: u32,
+        deleted: Vec<bool>,   // soft delete info for leaf pages
+        keys: Vec<K>,         // keys for interior and leaf pages
+        vals: Vec<V>,         // vals corresponding to keys for leaf pages
+        children: Vec<u32>,   // child page IDs for interior pages
+        sibling: Option<u32>, // right sibling page ID for leaf pages
+        is_leaf: bool,
+    }
+
+    /// BTree implements a B+Tree.
+    /// Each page has at most b children, where b is odd.
+    #[derive(Debug)]
+    pub struct BTree<K: Key, V: Val> {
+        b: usize,
+        is_unique: bool,
+        depth: usize,
+        root_id: u32,
+        next_id: u32,
+        pager: Box<dyn Pager<K, V>>,
+    }
+
+    // TODO
+    pub trait Pager<K: Key, V: Val>: fmt::Debug {
+        fn read_page(&self, id: u32) -> Result<&Page<K, V>, PageNotFoundError>;
+        fn write_page(&mut self, page: &Page<K, V>);
+    }
+
+    #[derive(Debug)]
+    pub struct MemPager<K: Key, V: Val> {
+        pages: Vec<Page<K, V>>,
+    }
+
+    impl<K: Key, V: Val> Pager<K, V> for MemPager<K, V> {
+        fn read_page(&self, id: u32) -> Result<&Page<K, V>, PageNotFoundError> {
+            let res = self.pages.binary_search_by_key(&id, |p| p.id);
+            match res {
+                Ok(idx) => Ok(&self.pages[idx]),
+                Err(_) => Err(PageNotFoundError),
+            }
+        }
+        fn write_page(&mut self, page: &Page<K, V>) {
+            let res = self.pages.binary_search_by_key(&page.id, |p| p.id);
+            match res {
+                Ok(idx) => {
+                    self.pages[idx] = page.clone();
+                }
+                Err(idx) => {
+                    self.pages.insert(idx, page.clone());
                 }
             }
-            Ok(())
         }
     }
 
@@ -94,89 +119,99 @@ pub mod btree {
         }
     }
 
-    impl<K: Key, V: Val> BTree<K, V> {
+    /// ------------------- BTree Implementation -------------------
+    impl<K: Key + 'static, V: Val + 'static> fmt::Display for BTree<K, V> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let vecs = self.traverse();
+            for (l, ids) in vecs.iter().enumerate() {
+                f.write_fmt(format_args!("LEVEL {:?}\n", l))?;
+
+                for &id in ids.iter() {
+                    f.write_fmt(format_args!("\t{:?}\n", self.pager.read_page(id).unwrap()))?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl<K: Key + 'static, V: Val + 'static> BTree<K, V> {
         pub fn new(b: usize, is_unique: bool) -> BTree<K, V> {
             assert_eq!(b % 2, 1);
             assert!(b > 2);
 
-            let pages = vec![Page {
-                id: 0,
-                keys: vec![],
-                vals: vec![],
-                children: vec![],
-                deleted: vec![],
-                is_leaf: true,
-                sibling: None,
-            }];
+            let pager = Box::new(MemPager {
+                pages: vec![Page {
+                    id: 0,
+                    keys: vec![],
+                    vals: vec![],
+                    children: vec![],
+                    deleted: vec![],
+                    is_leaf: true,
+                    sibling: None,
+                }],
+            });
+
             BTree {
-                b: b,
-                pages: pages,
-                is_unique: is_unique,
+                b,
+                is_unique,
+                pager,
                 depth: 0,
                 root_id: 0,
                 next_id: 1,
-                n_deleted: 0,
-                n_entries: 0,
             }
         }
-
-        // pub fn from_sorted(&mut self, vals: &Vec<V>) {
-        // TODO: efficient bulk loading
-        // }
 
         // Rebuild the tree to remove soft deleted keys.
-        pub fn rebuild(&mut self) {
-            let mut id = self.root_id;
-            for _ in 0..self.depth {
-                let page = &self.pages[id as usize];
-                id = page.children[0];
-            }
+        // pub fn rebuild(&mut self) {
+        //     let mut id = self.root_id;
+        //     for _ in 0..self.depth {
+        //         let page = &self.pager.read_page(id).unwrap();
+        //         id = page.children[0];
+        //     }
 
-            // traverse leaf pages to collect kv's
-            let mut keys: Vec<K> = Vec::with_capacity(self.n_entries);
-            let mut vals: Vec<V> = Vec::with_capacity(self.n_entries);
-            let max_pages = self.pages.len();
-            for _ in 0..max_pages {
-                let page = &mut self.pages[id as usize];
+        //     // traverse leaf pages to collect kv's
+        //     let mut keys: Vec<K> = Vec::new();
+        //     let mut vals: Vec<V> = Vec::new();
+        //     let max_pages = self.next_id;
+        //     for _ in 0..max_pages {
+        //         let page = self.pager.read_page(id).unwrap().clone();
 
-                // copy keys and vals that aren't marked deleted
-                let mut del = page.deleted.iter();
-                let mut keep_keys: Vec<K> = page.keys.drain(0..).collect();
-                keep_keys.retain(|_| !*del.next().unwrap());
-                keys.extend(keep_keys.into_iter());
+        //         // copy keys and vals that aren't marked deleted
+        //         let mut del = page.deleted.iter();
+        //         let mut keep_keys: Vec<K> = page.keys.drain(0..).collect();
+        //         keep_keys.retain(|_| !*del.next().unwrap());
+        //         keys.extend(keep_keys.into_iter());
 
-                del = page.deleted.iter();
-                let mut keep_vals: Vec<V> = page.vals.drain(0..).collect();
-                keep_vals.retain(|_| !*del.next().unwrap());
-                vals.extend(keep_vals.into_iter());
+        //         del = page.deleted.iter();
+        //         let mut keep_vals: Vec<V> = page.vals.drain(0..).collect();
+        //         keep_vals.retain(|_| !*del.next().unwrap());
+        //         vals.extend(keep_vals.into_iter());
 
-                match page.sibling {
-                    Some(sid) => {
-                        id = sid;
-                    }
-                    None => {
-                        break;
-                    }
-                }
-            }
+        //         match page.sibling {
+        //             Some(sid) => {
+        //                 id = sid;
+        //             }
+        //             None => {
+        //                 break;
+        //             }
+        //         }
+        //     }
 
-            // reset tree
-            self.pages = Self::new(self.b, self.is_unique).pages;
-            self.depth = 0;
-            self.root_id = 0;
-            self.next_id = 1;
-            self.n_deleted = 0;
-            self.n_entries = 0;
-            for (k, v) in keys.into_iter().zip(vals.into_iter()) {
-                let _ = self.insert(k, v);
-            }
-        }
+        //     // reset tree
+        //     self.pages = Self::new(self.b, self.is_unique).pages;
+        //     self.depth = 0;
+        //     self.root_id = 0;
+        //     self.next_id = 1;
+        //     for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+        //         let _ = self.insert(k, v);
+        //     }
+        // }
 
         // Return the value associated with key, or None if it doesn't exist.
         // If there are multiple values associated with the key, any can be returned.
         pub fn find(&self, key: &K) -> Option<V> {
             let id = self.find_leaf(key);
-            let leaf = &self.pages[id as usize];
+            let leaf = self.pager.read_page(id).unwrap();
             match leaf.keys.binary_search(key) {
                 Ok(idx) => {
                     if leaf.deleted[idx] {
@@ -193,7 +228,7 @@ pub mod btree {
         pub fn find_range(&self, min: &K, max: &K) -> Vec<(K, V)> {
             let mut kvs = vec![];
             let mut id = self.find_leaf(min);
-            let mut leaf = &self.pages[id as usize];
+            let mut leaf = self.pager.read_page(id).unwrap();
             let mut idx = match leaf.keys.binary_search(min) {
                 Ok(i) => i,
                 Err(i) => i,
@@ -215,7 +250,7 @@ pub mod btree {
                         break;
                     }
                 }
-                leaf = &self.pages[id as usize];
+                leaf = self.pager.read_page(id).unwrap();
                 idx = 0;
             }
             kvs
@@ -223,152 +258,195 @@ pub mod btree {
 
         // Insert a key-val pair into the tree.
         pub fn insert(&mut self, key: K, val: V) -> Result<(), DuplicateKeyError> {
-            self.n_entries += 1;
             let mut id = self.root_id;
             let mut visited = vec![];
             for _ in 0..self.depth {
-                visited.push(id.clone());
-                let page = &self.pages[id as usize];
+                visited.push(id);
+                let page = self.pager.read_page(id).unwrap();
                 let idx = page.find(&key);
                 id = page.children[idx];
             }
 
-            let mut needs_split = false;
-            {
-                // attempt insert key-val in the leaf page
-                let leaf = &mut self.pages[id as usize];
-                let search = leaf.keys.binary_search(&key);
-                let idx = search.unwrap_or_else(|x| x);
-                if search.is_err() || (search.is_ok() && !self.is_unique) {
-                    leaf.keys.insert(idx, key.clone());
-                    leaf.vals.insert(idx, val);
-                    leaf.deleted.insert(idx, false);
-                } else {
-                    // duplicate key on a unique tree:
-                    // try to replace a deleted entry, otherwise error
-                    if leaf.deleted[idx] {
-                        leaf.vals[idx] = val;
-                        leaf.deleted[idx] = false;
-                        return Ok(());
-                    } else {
-                        return Err(DuplicateKeyError);
-                    }
-                }
-
-                // since we inserted one entry, we can garbage collect one entry
-                let mut del_idx = leaf
-                    .deleted
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &b)| b)
-                    .map(|(i, _)| i);
-                if let Some(i) = del_idx.next() {
-                    leaf.deleted.remove(i);
-                    leaf.keys.remove(i);
-                    leaf.vals.remove(i);
-                }
-
-                if leaf.keys.len() >= self.b {
-                    needs_split = true;
-                }
-            }
-
-            // split page and propagate the split if necessary
-            if needs_split {
-                let mut par = visited.pop();
-                // try to overflow to sibling first
-                // otherwise split the page
-                if let Ok(()) = self.overflow_to_sibling(id, par) {
+            // attempt insert key-val in the leaf page
+            let mut page = self.pager.read_page(id).unwrap().clone();
+            let search = page.keys.binary_search(&key);
+            let idx = search.unwrap_or_else(|x| x);
+            if search.is_err() || (search.is_ok() && !self.is_unique) {
+                // key is not present, or duplicates are allowed:
+                // OK to insert
+                page.keys.insert(idx, key.clone());
+                page.vals.insert(idx, val);
+                page.deleted.insert(idx, false);
+            } else {
+                // duplicate key found on a unique tree:
+                // try to replace a deleted entry, otherwise error
+                if page.deleted[idx] {
+                    page.vals[idx] = val;
+                    page.deleted[idx] = false;
+                    self.pager.write_page(&page);
                     return Ok(());
                 } else {
-                    let max_splits = self.depth.clone() + 1;
-                    for _ in 0..max_splits {
-                        let split_more = self.split_page(id, par);
-                        if !split_more {
-                            break;
-                        } else {
-                            // par != None here since a new root page
-                            // is constructed when par == None.
-                            id = par.unwrap();
-                        }
-                        par = visited.pop();
-                    }
+                    return Err(DuplicateKeyError);
                 }
             }
-            Ok(())
+
+            // since we inserted one entry, we can garbage collect one entry
+            let mut del_idx = page
+                .deleted
+                .iter()
+                .rev()
+                .enumerate()
+                .filter(|&(_, &b)| b)
+                .map(|(i, _)| i);
+            if let Some(i) = del_idx.next() {
+                page.deleted.remove(i);
+                page.keys.remove(i);
+                page.vals.remove(i);
+            }
+
+            let mut needs_split = page.keys.len() >= self.b;
+            if !needs_split {
+                self.pager.write_page(&page);
+                Ok(())
+            } else {
+                let mut par_id_opt = visited.pop();
+                // TODO: OVERFLOW BORKEN
+                // try to overflow to sibling first
+                // if page.sibling.is_some() && par_id_opt.is_some() {
+                //     let par_id = par_id_opt.unwrap();
+                //     let sib_id = page.sibling.unwrap();
+                //     let mut parent = self.pager.read_page(par_id).unwrap().clone();
+                //     let mut sibling = self.pager.read_page(sib_id).unwrap().clone();
+
+                //     if let Ok(()) = self.overflow_to_sibling(&mut page, &mut sibling, &mut parent) {
+                //         self.pager.write_page(&page);
+                //         self.pager.write_page(&sibling);
+                //         self.pager.write_page(&parent);
+                //         return Ok(());
+                //     }
+                // }
+                // split page and propagate split upward if necessary
+                let max_splits = self.depth + 1;
+                for _ in 0..max_splits {
+                    match par_id_opt {
+                        Some(par_id) => {
+                            let mut parent = self.pager.read_page(par_id).unwrap().clone();
+                            let sibling = self.split_page(&mut page, &mut parent);
+                            self.pager.write_page(&page);
+                            self.pager.write_page(&sibling);
+
+                            needs_split = parent.keys.len() >= self.b;
+                            if !needs_split {
+                                self.pager.write_page(&parent);
+                                break;
+                            } else {
+                                // loop
+                                page = parent;
+                                par_id_opt = visited.pop();
+                            }
+                        }
+                        None => {
+                            // split root
+                            assert_eq!(self.root_id, page.id);
+                            let (sibling, root) = self.split_root(&mut page);
+
+                            self.pager.write_page(&page);
+                            self.pager.write_page(&sibling);
+                            self.pager.write_page(&root);
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
 
         // Attempt to overflow keys & vals of the leaf page to its right sibling.
         // Returns Err if overflow not possible.
-        fn overflow_to_sibling(
-            &mut self,
-            page_id: u32,
-            parent_id: Option<u32>,
-        ) -> Result<(), &'static str> {
-            let sibling_id = self.pages[page_id as usize].sibling;
-            if sibling_id.is_none() || parent_id.is_none() {
-                return Err("no sibling or no parent");
-            }
-            let sib_id = sibling_id.unwrap() as usize;
-            let par_id = parent_id.unwrap() as usize;
+        // fn overflow_to_sibling(
+        //     &mut self,
+        //     page: &mut Page<K, V>,
+        //     sibling: &mut Page<K, V>,
+        //     parent: &mut Page<K, V>,
+        // ) -> Result<(), &'static str> {
+        //     let p = page.keys.len();
+        //     let s = sibling.keys.len();
+        //     // how many keys to overflow from page?
+        //     let mov = {
+        //         // p > s + 1 ensures we can move at least one key to sibling
+        //         // p + s < b ensures we don't underflow
+        //         if s >= self.b || p <= s + 1 || p + s < self.b {
+        //             return Err("not attempting overflow");
+        //         }
+        //         (p - s) / 2
+        //     };
 
-            // how many keys to overflow from page?
-            let mov = {
-                let page = &self.pages[page_id as usize];
-                let p = page.keys.len();
-                let sib = &self.pages[sib_id];
-                let s = sib.keys.len();
+        //     // move data to sibling
+        //     // TODO: insert(0,-) is inefficient
+        //     for k in page.keys.drain((p - 1 - mov)..) {
+        //         sibling.keys.insert(0, k);
+        //     }
+        //     for v in page.vals.drain((p - 1 - mov)..) {
+        //         sibling.vals.insert(0, v);
+        //     }
+        //     for d in page.deleted.drain((p - 1 - mov)..) {
+        //         sibling.deleted.insert(0, d);
+        //     }
 
-                // p > s + 1 ensures we can move at least one key to sibling
-                // p + s < b ensures we don't underflow
-                if s >= self.b || p <= s + 1 || p + s < self.b {
-                    return Err("sibling full, not attempting overflow");
-                }
-                (p - s) / 2
-            };
-            // drain data from page
-            let (ks, vs, ds) = {
-                let page = &mut self.pages[page_id as usize];
-                let p = page.keys.len();
-                let ks: Vec<K> = page.keys.drain((p - 1 - mov)..).collect();
-                let vs: Vec<V> = page.vals.drain((p - 1 - mov)..).collect();
-                let ds: Vec<bool> = page.deleted.drain((p - 1 - mov)..).collect();
-                (ks, vs, ds)
-            };
-            // update parent key
-            {
-                let max_key = self.pages[page_id as usize].keys.last().unwrap().clone();
-                let parent = &mut self.pages[par_id];
-                let idx = parent.find(&max_key);
-                parent.keys[idx] = max_key;
-            }
-            // move data to sibling
-            {
-                let sib = &mut self.pages[sib_id];
-                // TODO: Vec::insert is inefficient
-                for k in ks.into_iter().rev() {
-                    sib.keys.insert(0, k);
-                }
-                for v in vs.into_iter().rev() {
-                    sib.vals.insert(0, v);
-                }
-                for d in ds.into_iter().rev() {
-                    sib.deleted.insert(0, d);
-                }
-            }
-            Ok(())
-        }
+        //     // update parent key
+        //     let max_key = page.keys.last().unwrap().clone();
+        //     let idx = parent.find(&max_key);
+        //     parent.keys[idx] = max_key;
 
-        // Split the given page by promoting a key to the next level of the tree,
-        // The key is promoted to the parent page if it exists, or to a new root page otherwise.
-        // Returns true if a further split of the parent page is necessary.
-        fn split_page(&mut self, page_id: u32, parent_id: Option<u32>) -> bool {
-            let page = &mut self.pages[page_id as usize];
-            if page.keys.len() < self.b {
-                return false;
-            }
+        //     Ok(())
+        // }
+
+        // Split the given page into two and promote a key its parent page.
+        // Mutates the page and parent and return the new right sibling.
+        fn split_page(&mut self, page: &mut Page<K, V>, parent: &mut Page<K, V>) -> Page<K, V> {
+            //println!("{} {}", page.keys.len(), self.b);
+            assert!(page.keys.len() >= self.b);
             let split_idx = self.b / 2;
             let split_key = page.keys[split_idx].clone();
+            // allocate right child page. the current page becomes left child page
+            let sibling = self.divide_page(page);
+
+            // insert left and right as parent's children
+            let idx = parent.find(&split_key);
+            parent.keys.insert(idx, split_key);
+            parent.children.insert(idx, page.id);
+            parent.children[idx + 1] = sibling.id;
+
+            sibling
+        }
+
+        // Splits a page without a parent i.e. the root page.
+        // In this case a new root page is created along with the right sibling page.
+        // Returns (sibling , new root).
+        fn split_root(&mut self, page: &mut Page<K, V>) -> (Page<K, V>, Page<K, V>) {
+            let split_idx = self.b / 2;
+            let split_key = page.keys[split_idx].clone();
+            let sibling = self.divide_page(page);
+            // current page was the root page; create a new root
+            let new_root: Page<K, V> = Page {
+                id: self.next_id as u32,
+                keys: vec![split_key],
+                children: vec![page.id, sibling.id],
+                vals: Vec::new(),
+                is_leaf: false,
+                sibling: None,
+                deleted: vec![],
+            };
+            self.next_id += 1;
+            self.root_id = new_root.id;
+            self.depth += 1;
+            (sibling, new_root)
+        }
+
+        // Helper function for page splitting: divide upper half of page into
+        // a new (right) sibling and returns the sibling.
+        fn divide_page(&mut self, page: &mut Page<K, V>) -> Page<K, V> {
+            let split_idx = self.b / 2;
 
             // allocate right child page. the current page becomes left child page
             let mut r_page = Page {
@@ -381,67 +459,35 @@ pub mod btree {
                 sibling: page.sibling,
             };
             self.next_id += 1;
-            let r_page_id = r_page.id.clone();
             r_page.keys = page.keys.drain((split_idx + 1)..).collect();
 
             if page.is_leaf {
                 r_page.vals = page.vals.drain((split_idx + 1)..).collect();
                 r_page.deleted = page.deleted.drain((split_idx + 1)..).collect();
-                page.sibling = Some(r_page_id);
+                page.sibling = Some(r_page.id);
             } else {
                 r_page.children = page.children.drain((split_idx + 1)..).collect();
             }
-            self.pages.push(r_page);
-
-            // insert left and right as parent's children
-            match parent_id {
-                Some(id) => {
-                    let parent_page = &mut self.pages[id as usize];
-                    let idx = parent_page.find(&split_key);
-                    parent_page.keys.insert(idx, split_key);
-                    parent_page.children.insert(idx, page_id);
-                    parent_page.children[idx + 1] = r_page_id;
-
-                    parent_page.keys.len() >= self.b
-                }
-                None => {
-                    // current page was the root page; create a new root
-                    let new_root: Page<K, V> = Page {
-                        id: self.next_id as u32,
-                        keys: vec![split_key],
-                        children: vec![page_id, r_page_id],
-                        vals: Vec::new(),
-                        is_leaf: false,
-                        sibling: None,
-                        deleted: vec![],
-                    };
-                    self.next_id += 1;
-                    self.root_id = new_root.id;
-                    self.depth += 1;
-                    self.pages.push(new_root);
-
-                    false
-                }
-            }
+            r_page
         }
 
         fn find_leaf(&self, key: &K) -> u32 {
             let mut id = self.root_id;
             for _ in 0..self.depth {
-                let page = &self.pages[id as usize];
+                let page = self.pager.read_page(id).unwrap();
                 let idx = page.find(key);
                 id = page.children[idx];
             }
             id
         }
 
-        // delete marks entries associatied with key as deleted
+        // Mark entries associatied with key as deleted
         pub fn delete(&mut self, key: &K) -> Result<usize, KeyNotFoundError> {
             let mut id = self.find_leaf(key);
             let mut n_deleted = 0;
 
             'outer: loop {
-                let leaf = &mut self.pages[id as usize];
+                let mut leaf = self.pager.read_page(id).unwrap().clone();
                 let idx = leaf.find(key);
                 for i in idx..leaf.deleted.len() {
                     if leaf.keys[i] != *key {
@@ -449,6 +495,7 @@ pub mod btree {
                     }
                     leaf.deleted[i] = true;
                     n_deleted += 1;
+                    self.pager.write_page(&leaf);
                 }
                 // we may have to search the siblings
                 match leaf.sibling {
@@ -460,7 +507,6 @@ pub mod btree {
                     }
                 }
             }
-            self.n_deleted += n_deleted;
             if n_deleted > 0 {
                 Ok(n_deleted)
             } else {
@@ -481,7 +527,7 @@ pub mod btree {
                             lvl += 1;
                             ids.push(vec![]);
                         }
-                        let page = &self.pages[id as usize];
+                        let page = self.pager.read_page(id).unwrap();
                         if page.is_leaf {
                             continue;
                         }
@@ -539,24 +585,61 @@ mod tests {
     #[test]
     fn test_insert_rand() {
         let mut rng = rand::thread_rng();
-        let mut bt: BTree<i32, i32> = BTree::new(133, false);
-
-        let mut keys: Vec<i32> = (0..10000)
-            .map(|_| {
-                let k = rng.gen::<i32>();
-                return k;
-            })
-            .collect();
-        keys.dedup();
-        let mut vals = vec![];
-        for &k in keys.iter() {
-            let val: i32 = rng.gen();
-            vals.push(val);
-            let err = bt.insert(k, val);
-            assert!(err.is_ok());
+        let sizes = [33, 101, 179, 213, 303];
+        for size in sizes.into_iter() {
+            println!("size={}", size);
+            let mut bt: BTree<i32, i32> = BTree::new(size, true);
+            let mut keys: Vec<i32> = (0..50000)
+                .map(|_| {
+                    let k = rng.gen::<i32>();
+                    return k;
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            let mut vals = vec![];
+            for &k in keys.iter() {
+                let val: i32 = rng.gen();
+                vals.push(val);
+                let err = bt.insert(k, val);
+                assert!(err.is_ok());
+            }
+            for (k, v) in keys.iter().zip(vals) {
+                assert_eq!(bt.find(k), Some(v));
+            }
         }
-        for (k, v) in keys.iter().zip(vals) {
-            assert_eq!(bt.find(k), Some(v));
+    }
+
+    #[test]
+    fn test_delete_rand() {
+        let sizes = [71, 155, 191, 211, 301];
+        for size in sizes.into_iter() {
+            println!("size={}", size);
+            let mut rng = rand::thread_rng();
+            let mut bt: BTree<i32, i32> = BTree::new(size, true);
+            let n = 50000;
+            let mut keys: Vec<i32> = (0..n)
+                .map(|_| {
+                    let k = rng.gen::<i32>();
+                    return k;
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            let mut vals = vec![];
+            for &k in keys.iter() {
+                let val: i32 = rng.gen();
+                vals.push(val);
+                let err = bt.insert(k, val);
+                assert!(err.is_ok());
+            }
+            for k in keys[n / 2..].iter() {
+                let err = bt.delete(k);
+                assert!(err.is_ok());
+            }
+            for (i, k) in keys[0..n / 2].iter().enumerate() {
+                assert_eq!(bt.find(k), Some(vals[i]));
+            }
         }
     }
 
@@ -587,36 +670,36 @@ mod tests {
         assert!(bt.insert(5, 555).is_ok());
     }
 
-    #[test]
-    fn test_rebuild() {
-        let mut bt: BTree<i32, i32> = BTree::new(3, false);
-        let kvs = [
-            (5, 55),
-            (6, 66),
-            (7, 77),
-            (9, 99),
-            (9, 999),
-            (9, 9999),
-            (10, 100),
-            (3, 333),
-        ];
-        for (k, v) in kvs.into_iter() {
-            let err = bt.insert(k, v);
-            assert!(err.is_ok());
-        }
-        assert!(bt.delete(&5).is_ok());
-        assert!(bt.delete(&9).is_ok());
-        assert!(bt.delete(&7).is_ok());
+    // #[test]
+    // fn test_rebuild() {
+    //     let mut bt: BTree<i32, i32> = BTree::new(3, false);
+    //     let kvs = [
+    //         (5, 55),
+    //         (6, 66),
+    //         (7, 77),
+    //         (9, 99),
+    //         (9, 999),
+    //         (9, 9999),
+    //         (10, 100),
+    //         (3, 333),
+    //     ];
+    //     for (k, v) in kvs.into_iter() {
+    //         let err = bt.insert(k, v);
+    //         assert!(err.is_ok());
+    //     }
+    //     assert!(bt.delete(&5).is_ok());
+    //     assert!(bt.delete(&9).is_ok());
+    //     assert!(bt.delete(&7).is_ok());
 
-        bt.rebuild();
+    //     bt.rebuild();
 
-        assert_eq!(bt.find(&9), None);
-        assert_eq!(bt.find(&5), None);
-        assert_eq!(bt.find(&7), None);
-        assert_eq!(bt.find(&10), Some(100));
-        assert_eq!(bt.find(&3), Some(333));
-        assert_eq!(bt.find(&6), Some(66));
-    }
+    //     assert_eq!(bt.find(&9), None);
+    //     assert_eq!(bt.find(&5), None);
+    //     assert_eq!(bt.find(&7), None);
+    //     assert_eq!(bt.find(&10), Some(100));
+    //     assert_eq!(bt.find(&3), Some(333));
+    //     assert_eq!(bt.find(&6), Some(66));
+    // }
 
     #[test]
     fn test_find_range() {

@@ -83,10 +83,10 @@ pub mod values {
         Ok(idx)
     }
 
-    pub struct TableMeta {
-        col_names: Vec<String>,
-        row_meta: Row, // reference row
-    }
+    // pub struct TableMeta {
+    //     col_names: Vec<String>,
+    //     row_meta: Row, // reference row
+    // }
 }
 
 #[cfg(test)]
