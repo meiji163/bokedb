@@ -1,24 +1,29 @@
 pub mod btree {
+    use crate::types::values::Serializable;
+    use crate::types::values::SerializeError;
     use std::cmp::Ord;
     use std::collections::VecDeque;
+    use std::convert::TryFrom;
     use std::fmt;
     use std::marker::Sized;
+    use std::mem::size_of;
 
-    /// Key and Val are trait aliases
-    pub trait Key: Ord + Clone + fmt::Debug
+    /// Key and Val are trait aliases for BTree key-val types.
+    pub trait Key: Ord + Clone + Serializable + fmt::Debug
     where
         Self: Sized,
     {
     }
-    pub trait Val: Clone + fmt::Debug
+    pub trait Val: Clone + fmt::Debug + Serializable
     where
         Self: Sized,
     {
     }
-    impl<T> Key for T where T: Ord + Clone + fmt::Debug {}
-    impl<T> Val for T where T: Clone + fmt::Debug {}
+    impl<T> Key for T where T: Ord + Clone + Serializable + fmt::Debug {}
+    impl<T> Val for T where T: Clone + fmt::Debug + Serializable {}
 
     /// ------------------- Error Types -------------------
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct KeyNotFoundError;
 
@@ -46,38 +51,33 @@ pub mod btree {
         }
     }
 
+    /// ------------------- BTree Pages -------------------
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum PageType {
+        Leaf = 0,
+        Interior = 1,
+    }
+
     pub const PAGE_SIZE: usize = 65536;
 
     /// Page is a BTree page, which can hold keys or key-vals
     #[derive(Debug, Clone)]
     pub struct Page<K: Key, V: Val> {
         id: u32,
+        ptype: PageType,
         deleted: Vec<bool>,   // soft delete info for leaf pages
         keys: Vec<K>,         // keys for interior and leaf pages
         vals: Vec<V>,         // vals corresponding to keys for leaf pages
         children: Vec<u32>,   // child page IDs for interior pages
         sibling: Option<u32>, // right sibling page ID for leaf pages
-        is_leaf: bool,
     }
 
-    /// BTree implements a B+Tree.
-    /// Each page has at most b children, where b is odd.
-    #[derive(Debug)]
-    pub struct BTree<K: Key, V: Val> {
-        b: usize,
-        is_unique: bool,
-        depth: usize,
-        root_id: u32,
-        next_id: u32,
-        pager: Box<dyn Pager<K, V>>,
-    }
-
-    // TODO
     pub trait Pager<K: Key, V: Val>: fmt::Debug {
         fn read_page(&self, id: u32) -> Result<&Page<K, V>, PageNotFoundError>;
         fn write_page(&mut self, page: &Page<K, V>);
     }
 
+    // MemPager is a simple in-memory page store.
     #[derive(Debug)]
     pub struct MemPager<K: Key, V: Val> {
         pages: Vec<Page<K, V>>,
@@ -104,6 +104,34 @@ pub mod btree {
         }
     }
 
+    pub fn pack_bits(bits: &Vec<bool>) -> Vec<u8> {
+        let len = (bits.len() + 7) / 8;
+        let mut bs = vec![0x0; len];
+        // write bits in LE order
+        for i in 0..len {
+            for j in 0..8 {
+                if 8 * i + j >= bits.len() {
+                    break;
+                }
+                bs[i] ^= (bits[8 * i + j] as u8) << (7 - j);
+            }
+        }
+        bs
+    }
+
+    // inverse of pack_bits
+    pub fn unpack_bits(len: usize, bytes: &[u8]) -> Vec<bool> {
+        let mut bits: Vec<bool> = vec![];
+        for b in bytes.iter() {
+            for j in (0..8).rev() {
+                let bit = ((*b >> j) & 1) == 1;
+                bits.push(bit);
+            }
+        }
+        bits.truncate(len);
+        bits
+    }
+
     impl<K: Key, V: Val> Page<K, V> {
         // Return the first index <= key
         fn find(&self, key: &K) -> usize {
@@ -117,9 +145,170 @@ pub mod btree {
             }
             i
         }
+
+        /// The byte layout of a page is as follows:
+        ///
+        /// Interior Page
+        ///  0-4    4          5-9       9-13
+        /// +----+-----------+----------+---------+
+        /// | id | page type | key size | key len |
+        /// +----+-----------+----------+---------+
+        /// | keys           | children           |
+        /// +----------------+--------------------+
+
+        /// Leaf Page
+        ///  0-4    4          5-9       9-13
+        /// +----+-----------+----------+---------+
+        /// | id | page type | key size | key len |
+        /// +----+-----------+----------+---------+
+        /// | keys | sibling | deleted  | vals    |
+        /// +----------------+--------------------+
+        fn to_bytes(&self) -> [u8; PAGE_SIZE] {
+            let mut bytes = [0; PAGE_SIZE];
+            let id_bytes: [u8; 4] = self.id.to_le_bytes();
+            bytes[0..4].copy_from_slice(&id_bytes);
+            bytes[4] = self.ptype as u8;
+            let key_size = u32::try_from(size_of::<K>()).unwrap();
+            bytes[5..9].copy_from_slice(&key_size.to_le_bytes());
+            let keys_len = u32::try_from(self.keys.len()).unwrap();
+            bytes[9..13].copy_from_slice(&keys_len.to_le_bytes());
+
+            let key_usize = key_size as usize;
+            let mut i = 13;
+            for k in self.keys.iter() {
+                bytes[i..(i + key_usize)].copy_from_slice(&k.to_bytes());
+                i += key_usize;
+            }
+
+            match self.ptype {
+                PageType::Interior => {
+                    for c in self.children.iter() {
+                        bytes[i..(i + 4)].copy_from_slice(&c.to_le_bytes());
+                        i += 4;
+                    }
+                }
+                PageType::Leaf => {
+                    assert_eq!(self.deleted.len(), self.vals.len());
+                    assert_eq!(self.vals.len(), self.keys.len());
+                    let sib = self.sibling.unwrap_or(u32::MAX);
+                    bytes[i..(i + 4)].copy_from_slice(&sib.to_le_bytes());
+                    i += 4;
+
+                    let del_bytes = pack_bits(&self.deleted);
+                    let del_len = del_bytes.len();
+                    bytes[i..(i + del_len)].copy_from_slice(&del_bytes);
+                    i += del_len;
+
+                    for v in self.vals.iter() {
+                        let v_bytes = v.to_bytes();
+                        let v_len = v_bytes.len();
+                        bytes[i..(i + v_len)].copy_from_slice(&v_bytes);
+                        i += v_len;
+                    }
+                }
+            }
+            bytes
+        }
+
+        fn from_bytes(bs: &[u8]) -> Result<(usize, Self), SerializeError> {
+            let id_bytes: [u8; 4] = bs[0..4].try_into().unwrap();
+            let id = u32::from_le_bytes(id_bytes);
+
+            let ptype = if bs[4] == PageType::Interior as u8 {
+                PageType::Interior
+            } else {
+                PageType::Leaf
+            };
+
+            let key_size_bytes: [u8; 4] = bs[5..9].try_into().unwrap();
+            let key_size = u32::from_le_bytes(key_size_bytes);
+            let keys_len_bytes: [u8; 4] = bs[9..13].try_into().unwrap();
+            let keys_len = u32::from_le_bytes(keys_len_bytes);
+
+            let key_usize = key_size as usize;
+            let keys_len_usize = keys_len as usize;
+            let mut keys = Vec::with_capacity(keys_len_usize);
+            let mut i = 13;
+            for j in 0..keys_len_usize {
+                let (size, key) = K::from_bytes(&bs[i..(i + key_usize)])?;
+                keys[j] = key;
+                i += size;
+            }
+
+            match ptype {
+                PageType::Interior => {
+                    let mut children = Vec::with_capacity(keys_len_usize);
+                    for j in 0..keys_len_usize {
+                        let cbytes: [u8; 4] = bs[i..(i + 4)].try_into().unwrap();
+                        let c = u32::from_le_bytes(cbytes);
+                        children[j] = c;
+                        i += 4;
+                    }
+
+                    Ok((
+                        i,
+                        Page {
+                            id,
+                            ptype,
+                            keys,
+                            children,
+                            vals: vec![],
+                            deleted: vec![],
+                            sibling: None,
+                        },
+                    ))
+                }
+                PageType::Leaf => {
+                    let sib_bytes: [u8; 4] = bs[i..(i + 4)].try_into().unwrap();
+                    let sib_id = u32::from_le_bytes(sib_bytes);
+                    let sibling = if sib_id == u32::MAX {
+                        None
+                    } else {
+                        Some(sib_id)
+                    };
+
+                    let del_len = ((keys_len_usize + 7) / 8);
+                    let deleted = unpack_bits(keys_len_usize, &bs[i..(i + del_len)]);
+                    i += del_len;
+
+                    let mut vals = Vec::with_capacity(keys_len_usize);
+                    for j in 0..keys_len_usize {
+                        let (size, val) = V::from_bytes(&bs[i..])?;
+                        vals[j] = val;
+                        i += size;
+                    }
+
+                    Ok((
+                        i,
+                        Page {
+                            id,
+                            ptype,
+                            keys,
+                            deleted,
+                            sibling,
+                            vals,
+                            children: vec![],
+                        },
+                    ))
+                }
+            }
+        }
     }
 
     /// ------------------- BTree Implementation -------------------
+
+    /// BTree implements a B+Tree.
+    /// Each page has at most b children, where b is odd.
+    #[derive(Debug)]
+    pub struct BTree<K: Key, V: Val> {
+        b: usize,
+        is_unique: bool,
+        depth: usize,
+        root_id: u32,
+        next_id: u32,
+        pager: Box<dyn Pager<K, V>>,
+    }
+
     impl<K: Key + 'static, V: Val + 'static> fmt::Display for BTree<K, V> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let vecs = self.traverse();
@@ -146,7 +335,7 @@ pub mod btree {
                     vals: vec![],
                     children: vec![],
                     deleted: vec![],
-                    is_leaf: true,
+                    ptype: PageType::Leaf,
                     sibling: None,
                 }],
             });
@@ -433,7 +622,7 @@ pub mod btree {
                 keys: vec![split_key],
                 children: vec![page.id, sibling.id],
                 vals: Vec::new(),
-                is_leaf: false,
+                ptype: PageType::Interior,
                 sibling: None,
                 deleted: vec![],
             };
@@ -455,13 +644,13 @@ pub mod btree {
                 vals: Vec::with_capacity(split_idx),
                 deleted: Vec::with_capacity(split_idx),
                 children: vec![],
-                is_leaf: page.is_leaf.clone(),
+                ptype: page.ptype.clone(),
                 sibling: page.sibling,
             };
             self.next_id += 1;
             r_page.keys = page.keys.drain((split_idx + 1)..).collect();
 
-            if page.is_leaf {
+            if page.ptype == PageType::Leaf {
                 r_page.vals = page.vals.drain((split_idx + 1)..).collect();
                 r_page.deleted = page.deleted.drain((split_idx + 1)..).collect();
                 page.sibling = Some(r_page.id);
@@ -528,7 +717,7 @@ pub mod btree {
                             ids.push(vec![]);
                         }
                         let page = self.pager.read_page(id).unwrap();
-                        if page.is_leaf {
+                        if page.ptype == PageType::Leaf {
                             continue;
                         }
                         for cid in page.children.iter() {
@@ -720,6 +909,25 @@ mod tests {
             assert!(k >= 51);
             assert!(300 >= k);
             assert_eq!(v, 3 * k);
+        }
+    }
+
+    #[test]
+    fn test_pack_bits() {
+        // 01101001 11000001 10110100 001
+        let bits = vec![
+            false, true, true, false, true, false, false, true, true, true, false, false, false,
+            false, false, true, true, false, true, true, false, true, false, false, false, false,
+            true,
+        ];
+        let len = bits.len();
+
+        let bytes = pack_bits(&bits);
+        assert_eq!(bytes.len(), 4);
+
+        let unpacked = unpack_bits(len, &bytes[..]);
+        for i in 0..bits.len() {
+            assert_eq!(bits[i], unpacked[i]);
         }
     }
 }

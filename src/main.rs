@@ -29,7 +29,7 @@ fn do_meta(cmd: MetaCommand) {
     }
 }
 
-fn do_select(bt: &BTree<i32, [Value; 2]>, stmt: Statement<i32, [Value; 2]>) -> Vec<Row> {
+fn do_select(bt: &BTree<i32, Vec<Value>>, stmt: Statement<i32, Vec<Value>>) -> Vec<Vec<Value>> {
     match stmt {
         Statement::SelectAll => bt
             .find_range(&i32::MIN, &i32::MAX)
@@ -54,7 +54,7 @@ fn do_select(bt: &BTree<i32, [Value; 2]>, stmt: Statement<i32, [Value; 2]>) -> V
 // insert 1 'meiji163' 'meiji163@github.com'
 
 fn main() -> io::Result<()> {
-    let mut bt: btree::BTree<i32, [Value; 2]> = btree::BTree::new(101, true);
+    let mut bt: btree::BTree<i32, Vec<Value>> = btree::BTree::new(101, true);
 
     let mut input_buf = String::with_capacity(4096);
     let mut stdin = io::stdin().lock();

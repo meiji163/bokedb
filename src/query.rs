@@ -23,7 +23,7 @@ pub mod sql {
         static ref DELETE_RE: Regex = Regex::new(r"^delete\s+(-?\d+)$").unwrap();
     }
 
-    pub fn parse_statement(s: &str) -> Option<Statement<i32, [Value; 2]>> {
+    pub fn parse_statement(s: &str) -> Option<Statement<i32, Vec<Value>>> {
         let mut itr = s.split_whitespace();
         let cmd = itr.next()?.to_lowercase();
         match cmd.as_str() {
@@ -31,10 +31,10 @@ pub mod sql {
                 let cap = INSERT_RE.captures(s)?;
                 let id = cap.get(1)?.as_str().parse::<i32>().unwrap();
                 let vals = [
-                    new_varchar(cap.get(2)?.as_str()),
-                    new_varchar(cap.get(3)?.as_str()),
+                    Value::VarChar(VarChar::new(cap.get(2)?.as_str())),
+                    Value::VarChar(VarChar::new(cap.get(3)?.as_str())),
                 ];
-                Some(Statement::Insert((id, vals)))
+                Some(Statement::Insert((id, vals.to_vec())))
             }
             "select" => {
                 let cap = SELECT_RE.captures(s)?;
