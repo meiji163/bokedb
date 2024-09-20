@@ -1,10 +1,13 @@
 pub mod btree {
     use crate::types::values::Serializable;
     use crate::types::values::SerializeError;
+
     use std::cmp::Ord;
     use std::collections::VecDeque;
     use std::convert::TryFrom;
     use std::fmt;
+    use std::fs::File;
+    use std::io::{prelude::*, Seek, SeekFrom};
     use std::marker::Sized;
     use std::mem::size_of;
 
@@ -63,18 +66,19 @@ pub mod btree {
     /// Page is a BTree page, which can hold keys or key-vals
     #[derive(Debug, Clone)]
     pub struct Page<K: Key, V: Val> {
-        id: u32,
-        ptype: PageType,
-        deleted: Vec<bool>,   // soft delete info for leaf pages
-        keys: Vec<K>,         // keys for interior and leaf pages
-        vals: Vec<V>,         // vals corresponding to keys for leaf pages
-        children: Vec<u32>,   // child page IDs for interior pages
-        sibling: Option<u32>, // right sibling page ID for leaf pages
+        pub id: u32,
+        pub ptype: PageType,
+        pub deleted: Vec<bool>,   // soft delete info for leaf pages
+        pub keys: Vec<K>,         // keys for interior and leaf pages
+        pub vals: Vec<V>,         // vals corresponding to keys for leaf pages
+        pub children: Vec<u32>,   // child page IDs for interior pages
+        pub sibling: Option<u32>, // right sibling page ID for leaf pages
     }
 
     pub trait Pager<K: Key, V: Val>: fmt::Debug {
-        fn read_page(&self, id: u32) -> Result<&Page<K, V>, PageNotFoundError>;
+        fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError>;
         fn write_page(&mut self, page: &Page<K, V>);
+        fn commit(&mut self);
     }
 
     // MemPager is a simple in-memory page store.
@@ -84,7 +88,7 @@ pub mod btree {
     }
 
     impl<K: Key, V: Val> Pager<K, V> for MemPager<K, V> {
-        fn read_page(&self, id: u32) -> Result<&Page<K, V>, PageNotFoundError> {
+        fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError> {
             let res = self.pages.binary_search_by_key(&id, |p| p.id);
             match res {
                 Ok(idx) => Ok(&self.pages[idx]),
@@ -102,12 +106,74 @@ pub mod btree {
                 }
             }
         }
+        fn commit(&mut self) {}
     }
 
+    // FilePager stores pages in a file.
+    #[derive(Debug)]
+    pub struct FilePager<K: Key, V: Val> {
+        wal: Vec<Page<K, V>>, // write ahead log
+        wal_max: usize,
+        offsets: Vec<(u32, u64)>, // pairs of (page ID, bytes offset)
+        file: File,
+        cache: Vec<Page<K, V>>,
+    }
+
+    impl<K: Key, V: Val> Pager<K, V> for FilePager<K, V> {
+        fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError> {
+            // first check WAL
+            for p in self.wal.iter() {
+                if p.id == id {
+                    return Ok(p);
+                }
+            }
+            // next check cache
+            let cached = self.cache.binary_search_by_key(&id, |p| p.id);
+            if let Ok(idx) = cached {
+                return Ok(&self.cache[idx]);
+            }
+            let cache_idx = cached.unwrap_err();
+            // read from file
+            let res = self.offsets.binary_search_by_key(&id, |&(p, _)| p);
+            if let Ok(idx) = res {
+                let ofs = self.offsets[idx].1;
+                self.file.seek(SeekFrom::Start(ofs)).unwrap();
+                let mut buf = [0x0; PAGE_SIZE];
+                self.file.read_exact(&mut buf);
+                let page: Page<K, V> = Page::from_bytes(&buf).unwrap().1;
+
+                self.cache.insert(cache_idx, page);
+                Ok(&self.cache[cache_idx])
+            } else {
+                Err(PageNotFoundError)
+            }
+        }
+
+        fn write_page(&mut self, page: &Page<K, V>) {
+            let mut in_wal = false;
+            for p in self.wal.iter_mut() {
+                if page.id == p.id {
+                    *p = page.clone();
+                    in_wal = true;
+                    break;
+                }
+            }
+            if !in_wal {
+                self.wal.push(page.clone());
+            }
+            if self.wal.len() > self.wal_max {
+                //self.file.write()
+            }
+        }
+
+        fn commit(&mut self) {}
+    }
+
+    // pack a vector of bits into bytes with padding,
+    // in litte-endian order
     pub fn pack_bits(bits: &Vec<bool>) -> Vec<u8> {
         let len = (bits.len() + 7) / 8;
         let mut bs = vec![0x0; len];
-        // write bits in LE order
         for i in 0..len {
             for j in 0..8 {
                 if 8 * i + j >= bits.len() {
@@ -149,7 +215,7 @@ pub mod btree {
         /// The byte layout of a page is as follows:
         ///
         /// Interior Page
-        ///  0-4    4          5-9       9-13
+        ///  0-3    4          5-8       9-12
         /// +----+-----------+----------+---------+
         /// | id | page type | key size | key len |
         /// +----+-----------+----------+---------+
@@ -157,13 +223,13 @@ pub mod btree {
         /// +----------------+--------------------+
 
         /// Leaf Page
-        ///  0-4    4          5-9       9-13
+        ///  0-3    4          5-8       9-12
         /// +----+-----------+----------+---------+
         /// | id | page type | key size | key len |
         /// +----+-----------+----------+---------+
         /// | keys | sibling | deleted  | vals    |
         /// +----------------+--------------------+
-        fn to_bytes(&self) -> [u8; PAGE_SIZE] {
+        pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
             let mut bytes = [0; PAGE_SIZE];
             let id_bytes: [u8; 4] = self.id.to_le_bytes();
             bytes[0..4].copy_from_slice(&id_bytes);
@@ -210,7 +276,7 @@ pub mod btree {
             bytes
         }
 
-        fn from_bytes(bs: &[u8]) -> Result<(usize, Self), SerializeError> {
+        pub fn from_bytes(bs: &[u8]) -> Result<(usize, Self), SerializeError> {
             let id_bytes: [u8; 4] = bs[0..4].try_into().unwrap();
             let id = u32::from_le_bytes(id_bytes);
 
@@ -229,19 +295,19 @@ pub mod btree {
             let keys_len_usize = keys_len as usize;
             let mut keys = Vec::with_capacity(keys_len_usize);
             let mut i = 13;
-            for j in 0..keys_len_usize {
+            for _ in 0..keys_len_usize {
                 let (size, key) = K::from_bytes(&bs[i..(i + key_usize)])?;
-                keys[j] = key;
+                keys.push(key);
                 i += size;
             }
 
             match ptype {
                 PageType::Interior => {
                     let mut children = Vec::with_capacity(keys_len_usize);
-                    for j in 0..keys_len_usize {
+                    for _ in 0..keys_len_usize {
                         let cbytes: [u8; 4] = bs[i..(i + 4)].try_into().unwrap();
                         let c = u32::from_le_bytes(cbytes);
-                        children[j] = c;
+                        children.push(c);
                         i += 4;
                     }
 
@@ -260,6 +326,7 @@ pub mod btree {
                 }
                 PageType::Leaf => {
                     let sib_bytes: [u8; 4] = bs[i..(i + 4)].try_into().unwrap();
+                    i += 4;
                     let sib_id = u32::from_le_bytes(sib_bytes);
                     let sibling = if sib_id == u32::MAX {
                         None
@@ -267,14 +334,14 @@ pub mod btree {
                         Some(sib_id)
                     };
 
-                    let del_len = ((keys_len_usize + 7) / 8);
+                    let del_len = (keys_len_usize + 7) / 8;
                     let deleted = unpack_bits(keys_len_usize, &bs[i..(i + del_len)]);
                     i += del_len;
 
                     let mut vals = Vec::with_capacity(keys_len_usize);
-                    for j in 0..keys_len_usize {
+                    for _ in 0..keys_len_usize {
                         let (size, val) = V::from_bytes(&bs[i..])?;
-                        vals[j] = val;
+                        vals.push(val);
                         i += size;
                     }
 
@@ -309,19 +376,19 @@ pub mod btree {
         pager: Box<dyn Pager<K, V>>,
     }
 
-    impl<K: Key + 'static, V: Val + 'static> fmt::Display for BTree<K, V> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let vecs = self.traverse();
-            for (l, ids) in vecs.iter().enumerate() {
-                f.write_fmt(format_args!("LEVEL {:?}\n", l))?;
+    // impl<K: Key + 'static, V: Val + 'static> fmt::Display for BTree<K, V> {
+    //     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    //         let vecs = self.traverse();
+    //         for (l, ids) in vecs.iter().enumerate() {
+    //             f.write_fmt(format_args!("LEVEL {:?}\n", l))?;
 
-                for &id in ids.iter() {
-                    f.write_fmt(format_args!("\t{:?}\n", self.pager.read_page(id).unwrap()))?;
-                }
-            }
-            Ok(())
-        }
-    }
+    //             for &id in ids.iter() {
+    //                 f.write_fmt(format_args!("\t{:?}\n", self.pager.read_page(id).unwrap()))?;
+    //             }
+    //         }
+    //         Ok(())
+    //     }
+    // }
 
     impl<K: Key + 'static, V: Val + 'static> BTree<K, V> {
         pub fn new(b: usize, is_unique: bool) -> BTree<K, V> {
@@ -398,7 +465,7 @@ pub mod btree {
 
         // Return the value associated with key, or None if it doesn't exist.
         // If there are multiple values associated with the key, any can be returned.
-        pub fn find(&self, key: &K) -> Option<V> {
+        pub fn find(&mut self, key: &K) -> Option<V> {
             let id = self.find_leaf(key);
             let leaf = self.pager.read_page(id).unwrap();
             match leaf.keys.binary_search(key) {
@@ -414,7 +481,7 @@ pub mod btree {
         }
 
         // Find key-value pairs where the min <= key <= max.
-        pub fn find_range(&self, min: &K, max: &K) -> Vec<(K, V)> {
+        pub fn find_range(&mut self, min: &K, max: &K) -> Vec<(K, V)> {
             let mut kvs = vec![];
             let mut id = self.find_leaf(min);
             let mut leaf = self.pager.read_page(id).unwrap();
@@ -660,7 +727,7 @@ pub mod btree {
             r_page
         }
 
-        fn find_leaf(&self, key: &K) -> u32 {
+        fn find_leaf(&mut self, key: &K) -> u32 {
             let mut id = self.root_id;
             for _ in 0..self.depth {
                 let page = self.pager.read_page(id).unwrap();
@@ -704,7 +771,7 @@ pub mod btree {
         }
 
         // traverse page IDs in level order
-        fn traverse(&self) -> Vec<Vec<u32>> {
+        fn traverse(&mut self) -> Vec<Vec<u32>> {
             let mut lvl = 0;
             let mut ids = vec![vec![self.root_id]];
             let mut q = VecDeque::from([(0, self.root_id)]);
@@ -739,6 +806,7 @@ pub mod btree {
 #[cfg(test)]
 mod tests {
     use super::btree::*;
+    use crate::types::values::*;
     use rand::prelude::*;
 
     #[test]
@@ -913,17 +981,37 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_page() {
+        let page: Page<i32, i32> = Page {
+            id: 1310,
+            ptype: PageType::Leaf,
+            keys: vec![44, 45, 49, 50, 55, 60],
+            vals: vec![45, 46, 50, 51, 56, 61],
+            deleted: vec![false, false, false, true, false, false],
+            sibling: None,
+            children: vec![],
+        };
+        let bytes = page.to_bytes();
+        let res: Result<(usize, Page<i32, i32>), SerializeError> = Page::from_bytes(&bytes);
+        assert!(res.is_ok());
+        let (_, got_page) = res.unwrap();
+        assert_eq!(page.id, got_page.id);
+        assert_eq!(page.ptype, got_page.ptype);
+        assert_eq!(page.keys, got_page.keys);
+        assert_eq!(page.vals, got_page.vals);
+        assert_eq!(page.deleted, got_page.deleted);
+    }
+
+    #[test]
     fn test_pack_bits() {
-        // 01101001 11000001 10110100 001
+        // 01101001 11000001 10110100 0011
         let bits = vec![
             false, true, true, false, true, false, false, true, true, true, false, false, false,
             false, false, true, true, false, true, true, false, true, false, false, false, false,
-            true,
+            true, true,
         ];
         let len = bits.len();
-
         let bytes = pack_bits(&bits);
-        assert_eq!(bytes.len(), 4);
 
         let unpacked = unpack_bits(len, &bytes[..]);
         for i in 0..bits.len() {

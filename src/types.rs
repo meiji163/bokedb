@@ -39,18 +39,18 @@ pub mod values {
 
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct VarChar {
-        val: String,
+        pub val: String,
         max_len: u32,
     }
 
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub struct DateTime {
-        year: u32,
-        month: u32,
-        day: u32,
-        hour: u32,
-        minute: u32,
-        second: u32,
+        pub year: u32,
+        pub month: u32,
+        pub day: u32,
+        pub hour: u32,
+        pub minute: u32,
+        pub second: u32,
     }
 
     impl fmt::Display for DateTime {
@@ -113,7 +113,13 @@ pub mod values {
             let len = u32::from_le_bytes(len_bytes);
             let size = 4 + (len as usize);
             let val = String::from_utf8(bs[4..size].to_vec())?;
-            Ok((size, VarChar { val, max_len: 0 }))
+            Ok((
+                size,
+                VarChar {
+                    val,
+                    max_len: VARCHAR_MAX_LEN,
+                },
+            ))
         }
         fn size(&self) -> usize {
             self.val.len() + 4
@@ -230,13 +236,13 @@ pub mod values {
             let len_bytes: [u8; 4] = bs[0..4].try_into().unwrap();
             let len = u32::from_le_bytes(len_bytes) as usize;
             let mut vs = Vec::with_capacity(len);
-            let mut j = 4;
-            for i in 0..len {
-                let (size, val) = Value::from_bytes(&bs[j..])?;
-                vs[i] = val;
-                j += size;
+            let mut i = 4;
+            for _ in 0..len {
+                let (size, val) = Value::from_bytes(&bs[i..])?;
+                vs.push(val);
+                i += size;
             }
-            Ok((j, vs))
+            Ok((i, vs))
         }
         fn size(&self) -> usize {
             self.to_bytes().len()
@@ -256,7 +262,31 @@ pub mod values {
 
 #[cfg(test)]
 mod tests {
-    // use super::values::*;
+    use super::values::*;
+    #[test]
+    fn test_serialize_row() {
+        let row = vec![
+            Value::Int(163),
+            Value::VarChar(VarChar::new("季文子三思而後行。子聞之、曰。再、斯可矣。")),
+            Value::DateTime(DateTime {
+                year: 2024,
+                month: 8,
+                day: 13,
+                hour: 21,
+                minute: 6,
+                second: 0,
+            }),
+        ];
+        let bytes = row.to_bytes();
+        let deser = Vec::from_bytes(&bytes);
+        assert!(deser.is_ok());
+        let (_, got_row) = deser.unwrap();
+        assert_eq!(got_row.len(), 3);
+        assert_eq!(row[0], got_row[0]);
+        assert_eq!(row[1], got_row[1]);
+        assert_eq!(row[2], got_row[2]);
+    }
+
     // #[test]
     // fn test_int_serialize() {
     //     let int1 = Value::Int(2345087);
