@@ -25,7 +25,7 @@ pub mod btree {
     impl<T> Key for T where T: Ord + Clone + Serializable + fmt::Debug {}
     impl<T> Val for T where T: Clone + fmt::Debug + Serializable {}
 
-    /// ------------------- Error Types -------------------
+    /// ------------------ Error Types -------------------
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct KeyNotFoundError;
