@@ -29,7 +29,7 @@ fn do_meta(cmd: MetaCommand) {
     }
 }
 
-fn do_select(bt: &BTree<i32, Vec<Value>>, stmt: Statement<i32, Vec<Value>>) -> Vec<Vec<Value>> {
+fn do_select(bt: &mut BTree<i32, Vec<Value>>, stmt: Statement<i32, Vec<Value>>) -> Vec<Vec<Value>> {
     match stmt {
         Statement::SelectAll => bt
             .find_range(&i32::MIN, &i32::MAX)
@@ -54,7 +54,7 @@ fn do_select(bt: &BTree<i32, Vec<Value>>, stmt: Statement<i32, Vec<Value>>) -> V
 // insert 1 'meiji163' 'meiji163@github.com'
 
 fn main() -> io::Result<()> {
-    let mut bt: btree::BTree<i32, Vec<Value>> = btree::BTree::new(101, true);
+    let mut bt: btree::BTree<i32, Vec<Value>> = btree::BTree::new_in_mem(101, true);
 
     let mut input_buf = String::with_capacity(4096);
     let mut stdin = io::stdin().lock();
@@ -76,7 +76,7 @@ fn main() -> io::Result<()> {
                 Some(stmt) => match stmt {
                     Statement::SelectAll | Statement::SelectOne(_) => {
                         println!("{0: <5} | {1: <32} | {2: <32}", "id", "username", "email");
-                        let rows = do_select(&bt, stmt);
+                        let rows = do_select(&mut bt, stmt);
                         for r in rows.iter() {
                             println!("{0: <5} | {1: <32} | {2: <32}", r[0], r[1], r[2]);
                         }
