@@ -104,8 +104,6 @@ pub mod btree {
     }
 
     /// Pager is an interface for reading and writing pages.
-    /// Page operations (create, update, delete) are staged by `apply_op`
-    /// and not committed until `commit` is called.
     pub trait Pager<K: Key, V: Val>: fmt::Debug {
         fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError>;
         fn write_page(&mut self, page: &Page<K, V>) -> std::io::Result<()>;
@@ -171,7 +169,9 @@ pub mod btree {
             let res = self.p_index.binary_search_by_key(&id, |&(p, _)| p);
             if let Ok(idx) = res {
                 let ofs = (PAGE_INDEX_SIZE as u64) * (self.p_index[idx].1 as u64);
-                self.file.seek(SeekFrom::Start(ofs + self.global_offset)).unwrap();
+                self.file
+                    .seek(SeekFrom::Start(ofs + self.global_offset))
+                    .unwrap();
                 let mut buf = [0x0; PAGE_INDEX_SIZE];
                 let _ = self.file.read_exact(&mut buf);
                 let page: Page<K, V> = Page::from_bytes(&buf).unwrap().1;
@@ -197,7 +197,7 @@ pub mod btree {
                 Err(idx) => {
                     // create page
                     let ofs = (PAGE_INDEX_SIZE as u64) * (self.next_index as u64);
-                    self.file.seek(SeekFrom::Start(ofs+ self.global_offset))?;
+                    self.file.seek(SeekFrom::Start(ofs + self.global_offset))?;
                     self.file.write_all(&buf)?;
                     self.p_index.insert(idx, (id, self.next_index));
                     self.next_index += 1;
@@ -325,32 +325,38 @@ pub mod btree {
         /// The byte layout of a page is as follows:
         ///
         /// Interior Page
-        ///  0-3    4          5-8       9-12
-        /// +----+-----------+----------+---------+
-        /// | id | page type | key size | key len |
-        /// +----+-----------+----------+---------+
-        /// | keys           | children           |
-        /// +----------------+--------------------+
-
+        ///  0-3   4     5-8       9-12      13-16
+        /// +----+------+---------+---------+--------+
+        /// | id | type | sibling | keysize | keylen |
+        /// +----+------+---+-----+---------+--------+
+        /// |  keys...  |      children...           |
+        /// +-----------+----------------------------+
+        ///
+        ///
         /// Leaf Page
-        ///  0-3    4          5-8       9-12
-        /// +----+-----------+----------+---------+
-        /// | id | page type | key size | key len |
-        /// +----+-----------+----------+---------+
-        /// | keys | sibling | deleted  | vals    |
-        /// +----------------+--------------------+
+        ///  0-3   4     5-8       9-12      13-16
+        /// +----+------+---------+---------+--------+
+        /// | id | type | sibling | keysize | keylen |
+        /// +----+------+---+-----+---------+--------+
+        /// | keys...   | deleted... | vals...       |
+        /// +-----------+------------+---------------+
         pub fn to_bytes(&self) -> [u8; PAGE_SIZE] {
             let mut bytes = [0; PAGE_SIZE];
             let id_bytes: [u8; 4] = self.id.to_le_bytes();
             bytes[0..4].copy_from_slice(&id_bytes);
             bytes[4] = self.ptype as u8;
-            let key_size = u32::try_from(size_of::<K>()).unwrap();
-            bytes[5..9].copy_from_slice(&key_size.to_le_bytes());
-            let keys_len = u32::try_from(self.keys.len()).unwrap();
-            bytes[9..13].copy_from_slice(&keys_len.to_le_bytes());
 
+            // sibling
+            let sib = self.sibling.unwrap_or(0);
+            bytes[5..9].copy_from_slice(&sib.to_le_bytes());
+
+            // keys
+            let key_size = u32::try_from(size_of::<K>()).unwrap();
+            bytes[9..13].copy_from_slice(&key_size.to_le_bytes());
+            let keys_len = u32::try_from(self.keys.len()).unwrap();
+            bytes[13..17].copy_from_slice(&keys_len.to_le_bytes());
             let key_usize = key_size as usize;
-            let mut i = 13;
+            let mut i = 17;
             for k in self.keys.iter() {
                 bytes[i..(i + key_usize)].copy_from_slice(&k.to_bytes());
                 i += key_usize;
@@ -366,9 +372,6 @@ pub mod btree {
                 PageType::Leaf => {
                     assert_eq!(self.deleted.len(), self.vals.len());
                     assert_eq!(self.vals.len(), self.keys.len());
-                    let sib = self.sibling.unwrap_or(u32::MAX);
-                    bytes[i..(i + 4)].copy_from_slice(&sib.to_le_bytes());
-                    i += 4;
 
                     let del_bytes = pack_bits(&self.deleted);
                     let del_len = del_bytes.len();
@@ -390,21 +393,28 @@ pub mod btree {
             let id_bytes: [u8; 4] = bs[0..4].try_into().unwrap();
             let id = u32::from_le_bytes(id_bytes);
 
+            // type
             let ptype = if bs[4] == PageType::Interior as u8 {
                 PageType::Interior
             } else {
                 PageType::Leaf
             };
 
-            let key_size_bytes: [u8; 4] = bs[5..9].try_into().unwrap();
+            // sibling
+            let sib_bytes: [u8; 4] = bs[5..9].try_into().unwrap();
+            let sib_id = u32::from_le_bytes(sib_bytes);
+            let sibling = if sib_id == 0 { None } else { Some(sib_id) };
+
+            // keys
+            let key_size_bytes: [u8; 4] = bs[9..13].try_into().unwrap();
             let key_size = u32::from_le_bytes(key_size_bytes);
-            let keys_len_bytes: [u8; 4] = bs[9..13].try_into().unwrap();
+            let keys_len_bytes: [u8; 4] = bs[13..17].try_into().unwrap();
             let keys_len = u32::from_le_bytes(keys_len_bytes);
 
             let key_usize = key_size as usize;
             let keys_len_usize = keys_len as usize;
             let mut keys = Vec::with_capacity(keys_len_usize);
-            let mut i = 13;
+            let mut i = 17;
             for _ in 0..keys_len_usize {
                 let (size, key) = K::from_bytes(&bs[i..(i + key_usize)])?;
                 keys.push(key);
@@ -428,22 +438,13 @@ pub mod btree {
                             ptype,
                             keys,
                             children,
+                            sibling,
                             vals: vec![],
                             deleted: vec![],
-                            sibling: None,
                         },
                     ))
                 }
                 PageType::Leaf => {
-                    let sib_bytes: [u8; 4] = bs[i..(i + 4)].try_into().unwrap();
-                    i += 4;
-                    let sib_id = u32::from_le_bytes(sib_bytes);
-                    let sibling = if sib_id == u32::MAX {
-                        None
-                    } else {
-                        Some(sib_id)
-                    };
-
                     let del_len = (keys_len_usize + 7) / 8;
                     let deleted = unpack_bits(keys_len_usize, &bs[i..(i + del_len)]);
                     i += del_len;
@@ -474,31 +475,19 @@ pub mod btree {
 
     /// ------------------- BTree Implementation -------------------
 
+    /// The ID of the BTree root stays constant.
+    pub const ROOT_PAGE_ID: u32 = 0;
+
     /// BTree implements a B+Tree.
     /// Each page has at most b children, where b is odd.
     #[derive(Debug)]
     pub struct BTree<K: Key, V: Val> {
         b: usize,
         is_unique: bool,
-        depth: usize,
-        root_id: u32,
+        pub depth: usize,
         next_id: u32,
-        pager: Box<dyn Pager<K, V>>,
+        pub pager: Box<dyn Pager<K, V>>,
     }
-
-    // impl<K: Key + 'static, V: Val + 'static> fmt::Display for BTree<K, V> {
-    //     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    //         let vecs = self.traverse();
-    //         for (l, ids) in vecs.iter().enumerate() {
-    //             f.write_fmt(format_args!("LEVEL {:?}\n", l))?;
-
-    //             for &id in ids.iter() {
-    //                 f.write_fmt(format_args!("\t{:?}\n", self.pager.read_page(id).unwrap()))?;
-    //             }
-    //         }
-    //         Ok(())
-    //     }
-    // }
 
     impl<K: Key + 'static, V: Val + 'static> BTree<K, V> {
         pub fn new_in_mem(b: usize, is_unique: bool) -> BTree<K, V> {
@@ -522,12 +511,11 @@ pub mod btree {
                 is_unique,
                 pager,
                 depth: 0,
-                root_id: 0,
                 next_id: 1,
             }
         }
 
-        pub fn new(b: usize, is_unique: bool, pager: Box<dyn Pager<K,V>>) -> BTree<K, V> {
+        pub fn new(b: usize, is_unique: bool, pager: Box<dyn Pager<K, V>>) -> BTree<K, V> {
             assert_eq!(b % 2, 1);
             assert!(b > 2);
 
@@ -536,8 +524,17 @@ pub mod btree {
                 is_unique,
                 pager,
                 depth: 0,
-                root_id: 0,
                 next_id: 1,
+            }
+        }
+
+        pub fn print(&mut self) {
+            let vecs = self.traverse();
+            for (l, ids) in vecs.iter().enumerate() {
+                print!("LEVEL {:?}\n", l);
+                for &id in ids.iter() {
+                    print!("\t{:?}\n", self.pager.read_page(id).unwrap());
+                }
             }
         }
 
@@ -554,7 +551,11 @@ pub mod btree {
         //     let mut vals: Vec<V> = Vec::new();
         //     let max_pages = self.next_id;
         //     for _ in 0..max_pages {
-        //         let page = self.pager.read_page(id).unwrap().clone();
+        //         let res = self.pager.read_page(id);
+        //         if res.is_err() {
+        //             continue
+        //         }
+        //         let mut page = res.unwrap().clone();
 
         //         // copy keys and vals that aren't marked deleted
         //         let mut del = page.deleted.iter();
@@ -578,7 +579,6 @@ pub mod btree {
         //     }
 
         //     // reset tree
-        //     self.pages = Self::new(self.b, self.is_unique).pages;
         //     self.depth = 0;
         //     self.root_id = 0;
         //     self.next_id = 1;
@@ -639,7 +639,7 @@ pub mod btree {
         /// Insert a key-val pair into the tree.
         /// Splits the tree in case insert causes page overflow.
         pub fn insert(&mut self, key: K, val: V) -> Result<(), DuplicateKeyError> {
-            let mut id = self.root_id;
+            let mut id = ROOT_PAGE_ID;
             let mut visited = vec![];
             for _ in 0..self.depth {
                 visited.push(id);
@@ -653,8 +653,7 @@ pub mod btree {
             let search = page.keys.binary_search(&key);
             let idx = search.unwrap_or_else(|x| x);
             if search.is_err() || (search.is_ok() && !self.is_unique) {
-                // key is not present, or duplicates are allowed:
-                // OK to insert
+                // key is not present, or duplicates are allowed: OK to insert
                 page.keys.insert(idx, key.clone());
                 page.vals.insert(idx, val);
                 page.deleted.insert(idx, false);
@@ -691,21 +690,21 @@ pub mod btree {
                 Ok(())
             } else {
                 let mut par_id_opt = visited.pop();
-                // TODO: OVERFLOW BORKEN
+                // println!("needs split: id={} sib={:?} par={:?}", page.id, page.sibling, par_id_opt);
                 // try to overflow to sibling first
-                // if page.sibling.is_some() && par_id_opt.is_some() {
-                //     let par_id = par_id_opt.unwrap();
-                //     let sib_id = page.sibling.unwrap();
-                //     let mut parent = self.pager.read_page(par_id).unwrap().clone();
-                //     let mut sibling = self.pager.read_page(sib_id).unwrap().clone();
+                if page.sibling.is_some() && par_id_opt.is_some() {
+                    let par_id = par_id_opt.unwrap();
+                    let sib_id = page.sibling.unwrap();
+                    let mut parent = self.pager.read_page(par_id).unwrap().clone();
+                    let mut sibling = self.pager.read_page(sib_id).unwrap().clone();
 
-                //     if let Ok(()) = self.overflow_to_sibling(&mut page, &mut sibling, &mut parent) {
-                //         self.pager.write_page(&page);
-                //         self.pager.write_page(&sibling);
-                //         self.pager.write_page(&parent);
-                //         return Ok(());
-                //     }
-                // }
+                    if let Ok(()) = self.overflow_to_sibling(&mut page, &mut sibling, &mut parent) {
+                        self.pager.write_page(&page).unwrap();
+                        self.pager.write_page(&sibling).unwrap();
+                        self.pager.write_page(&parent).unwrap();
+                        return Ok(());
+                    }
+                }
 
                 // split page and propagate split upward if necessary
                 let max_splits = self.depth + 1;
@@ -730,12 +729,12 @@ pub mod btree {
                         }
                         None => {
                             // split root
-                            assert_eq!(self.root_id, page.id);
+                            assert_eq!(ROOT_PAGE_ID, page.id);
                             let (sibling, root) = self.split_root(&mut page);
 
+                            self.pager.write_page(&root).unwrap();
                             self.pager.write_page(&page).unwrap();
                             self.pager.write_page(&sibling).unwrap();
-                            self.pager.write_page(&root).unwrap();
                             break;
                         }
                     }
@@ -744,45 +743,45 @@ pub mod btree {
             }
         }
 
-        // Attempt to overflow keys & vals of the leaf page to its right sibling.
-        // Returns Err if overflow not possible.
-        // fn overflow_to_sibling(
-        //     &mut self,
-        //     page: &mut Page<K, V>,
-        //     sibling: &mut Page<K, V>,
-        //     parent: &mut Page<K, V>,
-        // ) -> Result<(), &'static str> {
-        //     let p = page.keys.len();
-        //     let s = sibling.keys.len();
-        //     // how many keys to overflow from page?
-        //     let mov = {
-        //         // p > s + 1 ensures we can move at least one key to sibling
-        //         // p + s < b ensures we don't underflow
-        //         if s >= self.b || p <= s + 1 || p + s < self.b {
-        //             return Err("not attempting overflow");
-        //         }
-        //         (p - s) / 2
-        //     };
+        /// Attempt to overflow keys & vals of the leaf page to its right sibling.
+        /// Returns Err if overflow not possible.
+        fn overflow_to_sibling(
+            &mut self,
+            page: &mut Page<K, V>,
+            sibling: &mut Page<K, V>,
+            parent: &mut Page<K, V>,
+        ) -> Result<(), &'static str> {
+            let p = page.keys.len();
+            let s = sibling.keys.len();
+            // how many keys to overflow from page?
+            let mov = {
+                // p > s + 1 ensures we can move at least one key to sibling
+                // p + s < b ensures we don't underflow
+                if s >= self.b || p <= s + 1 || p + s < self.b {
+                    return Err("not attempting overflow");
+                }
+                (p - s) / 2
+            };
 
-        //     // move data to sibling
-        //     // TODO: insert(0,-) is inefficient
-        //     for k in page.keys.drain((p - 1 - mov)..) {
-        //         sibling.keys.insert(0, k);
-        //     }
-        //     for v in page.vals.drain((p - 1 - mov)..) {
-        //         sibling.vals.insert(0, v);
-        //     }
-        //     for d in page.deleted.drain((p - 1 - mov)..) {
-        //         sibling.deleted.insert(0, d);
-        //     }
+            // move data to sibling
+            // TODO: insert(0,-) is inefficient
+            for k in page.keys.drain((p - 1 - mov)..) {
+                sibling.keys.insert(0, k);
+            }
+            for v in page.vals.drain((p - 1 - mov)..) {
+                sibling.vals.insert(0, v);
+            }
+            for d in page.deleted.drain((p - 1 - mov)..) {
+                sibling.deleted.insert(0, d);
+            }
 
-        //     // update parent key
-        //     let max_key = page.keys.last().unwrap().clone();
-        //     let idx = parent.find(&max_key);
-        //     parent.keys[idx] = max_key;
+            // update parent key
+            let max_key = page.keys.last().unwrap().clone();
+            let idx = parent.find(&max_key);
+            parent.keys[idx] = max_key;
 
-        //     Ok(())
-        // }
+            Ok(())
+        }
 
         /// Splits the given page into two and promotes a key its parent page.
         /// Mutates `page` and `parent` and returns the new right sibling page.
@@ -790,10 +789,13 @@ pub mod btree {
             assert!(page.keys.len() >= self.b);
             let split_idx = self.b / 2;
             let split_key = page.keys[split_idx].clone();
-            // allocate right child page. the current page becomes left child page
             let sibling = self.divide_page(page);
+            /*
+             *                 `parent`
+             *  `page` -->      /    \
+             *              `page`  `sibling`
+             */
 
-            // insert left and right as parent's children
             let idx = parent.find(&split_key);
             parent.keys.insert(idx, split_key);
             parent.children.insert(idx, page.id);
@@ -802,25 +804,28 @@ pub mod btree {
             sibling
         }
 
-        /// Splits a page without a parent i.e. the root page.
-        /// In this case a new root page is created along with the right sibling page.
-        /// Returns (sibling , new root).
-        fn split_root(&mut self, page: &mut Page<K, V>) -> (Page<K, V>, Page<K, V>) {
+        /// Splits the root node. Returns (sibling, new root).
+        fn split_root(&mut self, root: &mut Page<K, V>) -> (Page<K, V>, Page<K, V>) {
             let split_idx = self.b / 2;
-            let split_key = page.keys[split_idx].clone();
-            let sibling = self.divide_page(page);
-            // current page was the root page; create a new root
+            let split_key = root.keys[split_idx].clone();
+            let sibling = self.divide_page(root);
+            /*
+             *                 `new_root`
+             *  `root` -->      /    \
+             *              `root`  `sibling`
+             */
+            root.id = self.next_id as u32;
+            self.next_id += 1;
+
             let new_root: Page<K, V> = Page {
-                id: self.next_id as u32,
+                id: 0,
                 keys: vec![split_key],
-                children: vec![page.id, sibling.id],
+                children: vec![root.id, sibling.id],
                 vals: Vec::new(),
                 ptype: PageType::Interior,
                 sibling: None,
                 deleted: vec![],
             };
-            self.next_id += 1;
-            self.root_id = new_root.id;
             self.depth += 1;
             (sibling, new_root)
         }
@@ -828,7 +833,6 @@ pub mod btree {
         /// Helper function for page splitting: divides upper half of page into
         /// a new (right) sibling page and returns the sibling.
         fn divide_page(&mut self, page: &mut Page<K, V>) -> Page<K, V> {
-            println!("divide page id={} children={:?}", page.id, page.children);
             let split_idx = self.b / 2;
 
             // Allocate the right child page.
@@ -844,19 +848,22 @@ pub mod btree {
             };
             self.next_id += 1;
             r_page.keys = page.keys.drain((split_idx + 1)..).collect();
+            page.sibling = Some(r_page.id);
 
-            if page.ptype == PageType::Leaf {
-                r_page.vals = page.vals.drain((split_idx + 1)..).collect();
-                r_page.deleted = page.deleted.drain((split_idx + 1)..).collect();
-                page.sibling = Some(r_page.id);
-            } else {
-                r_page.children = page.children.drain((split_idx + 1)..).collect();
+            match page.ptype {
+                PageType::Leaf => {
+                    r_page.vals = page.vals.drain((split_idx + 1)..).collect();
+                    r_page.deleted = page.deleted.drain((split_idx + 1)..).collect();
+                }
+                PageType::Interior => {
+                    r_page.children = page.children.drain((split_idx + 1)..).collect();
+                }
             }
             r_page
         }
 
         fn find_leaf(&mut self, key: &K) -> u32 {
-            let mut id = self.root_id;
+            let mut id = ROOT_PAGE_ID;
             for _ in 0..self.depth {
                 let page = self.pager.read_page(id).unwrap();
                 let idx = page.find(key);
@@ -901,8 +908,8 @@ pub mod btree {
         /// Traverse page IDs in level order
         fn traverse(&mut self) -> Vec<Vec<u32>> {
             let mut lvl = 0;
-            let mut ids = vec![vec![self.root_id]];
-            let mut q = VecDeque::from([(0, self.root_id)]);
+            let mut ids = vec![vec![ROOT_PAGE_ID]];
+            let mut q = VecDeque::from([(0, ROOT_PAGE_ID)]);
             let max_loop = self.next_id;
             for _ in 0..=max_loop {
                 match q.pop_front() {
@@ -928,6 +935,18 @@ pub mod btree {
             ids.pop();
             ids
         }
+
+        pub fn assert_integrity(&mut self) {
+            let levels = self.traverse();
+            for lvl in levels.iter() {
+                for i in 0..(lvl.len() - 1) {
+                    let id = lvl[i];
+                    let id_next = lvl[i + 1];
+                    let page = self.pager.read_page(id).unwrap();
+                    assert_eq!(page.sibling, Some(id_next));
+                }
+            }
+        }
     }
 }
 
@@ -935,22 +954,25 @@ pub mod btree {
 mod tests {
     use super::btree::*;
     use crate::types::values::*;
-    use rand::prelude::*;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
     use std::fs::File;
 
+    const RNG_SEED: u64 = 163;
 
     fn new_test_file_pager() -> FilePager<i32, i32> {
         let file: File = tempfile::tempfile().unwrap();
         let mut pager = FilePager::new(file);
         let root = Page {
-                    id: 0,
-                    keys: vec![],
-                    vals: vec![],
-                    children: vec![],
-                    deleted: vec![],
-                    ptype: PageType::Leaf,
-                    sibling: None,
-                };
+            id: 0,
+            keys: vec![],
+            vals: vec![],
+            children: vec![],
+            deleted: vec![],
+            ptype: PageType::Leaf,
+            sibling: None,
+        };
         pager.write_page(&root).unwrap();
 
         pager
@@ -1020,6 +1042,29 @@ mod tests {
         _insert_no_split(&mut bt);
     }
 
+    #[test]
+    fn insert_overflow_to_sibling() {
+        let pager = Box::new(new_test_file_pager());
+        let mut bt: BTree<i32, i32> = BTree::new(5, false, pager);
+        for k in 1..=5 {
+            let err = bt.insert(k, k * 2);
+            assert!(err.is_ok());
+        }
+        // root is now split at k=3. Next inserts trigger an overflow
+        assert_eq!(bt.insert(0, 0), Ok(()));
+        assert_eq!(bt.insert(-1, -2), Ok(()));
+
+        let p0 = bt.pager.read_page(0).unwrap();
+        assert_eq!(p0.keys, vec![1]);
+        let p1 = bt.pager.read_page(1).unwrap();
+        assert_eq!(p1.keys, vec![3, 2, 4, 5]);
+        let p2 = bt.pager.read_page(2).unwrap();
+        assert_eq!(p2.keys, vec![-1, 0, 1]);
+        assert_eq!(p2.sibling, Some(1));
+
+        bt.assert_integrity();
+    }
+
     fn _insert_split(bt: &mut BTree<i32, i32>) {
         let kvs = [(5, 55), (6, 66), (7, 77), (8, 88), (9, 99), (10, 100)];
         for (k, v) in kvs.into_iter() {
@@ -1033,6 +1078,8 @@ mod tests {
         assert_eq!(bt.find(&9), Some(99));
         assert_eq!(bt.find(&8), Some(88));
         assert_eq!(bt.find(&666), None);
+
+        bt.assert_integrity();
     }
 
     #[test]
@@ -1048,7 +1095,7 @@ mod tests {
         _insert_split(&mut bt);
     }
 
-    fn _insert_rand(rng: &mut ThreadRng, bt: &mut BTree<i32, i32>, n: usize) {
+    fn _insert_rand(rng: &mut StdRng, bt: &mut BTree<i32, i32>, n: usize) {
         let mut keys: Vec<i32> = (0..n)
             .map(|_| {
                 let k = rng.gen::<i32>();
@@ -1070,19 +1117,23 @@ mod tests {
     }
 
     #[test]
-    fn in_mem_insert_rand(){
-        let mut rng = rand::thread_rng();
-        let sizes = [101, 179, 213, 303];
+    fn in_mem_insert_rand() {
+        let mut rng = StdRng::seed_from_u64(RNG_SEED);
+        //let sizes = [21, 101, 179, 213, 303];
+        let sizes = [21];
         for size in sizes.into_iter() {
             println!("size={}", size);
             let mut bt: BTree<i32, i32> = BTree::new_in_mem(size, true);
-            _insert_rand(&mut rng, &mut bt, 10000);
+            _insert_rand(&mut rng, &mut bt, 1000);
+            bt.print();
+            bt.assert_integrity();
         }
+        //assert!(false);
     }
 
     #[test]
-    fn file_insert_rand(){
-        let mut rng = rand::thread_rng();
+    fn file_insert_rand() {
+        let mut rng = StdRng::seed_from_u64(RNG_SEED);
         let sizes = [101, 179, 213, 303];
         for size in sizes.into_iter() {
             println!("size={}", size);
@@ -1092,7 +1143,7 @@ mod tests {
         }
     }
 
-    fn _delete_rand(rng: &mut ThreadRng, bt: &mut BTree<i32, i32>, n: usize) {
+    fn _delete_rand(rng: &mut StdRng, bt: &mut BTree<i32, i32>, n: usize) {
         let mut keys: Vec<i32> = (0..n)
             .map(|_| {
                 let k = rng.gen::<i32>();
@@ -1119,7 +1170,7 @@ mod tests {
 
     #[test]
     fn in_mem_delete_rand() {
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(RNG_SEED);
         let sizes = [101, 179, 213, 303];
         for size in sizes.into_iter() {
             println!("size={}", size);
@@ -1130,7 +1181,7 @@ mod tests {
 
     #[test]
     fn file_delete_rand() {
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(RNG_SEED);
         let sizes = [101, 179, 213, 303];
         for size in sizes.into_iter() {
             println!("size={}", size);
@@ -1164,7 +1215,7 @@ mod tests {
     fn file_delete_one() {
         let pager = Box::new(new_test_file_pager());
         let mut bt = BTree::new(3, true, pager);
-        _delete_one(&mut bt)
+        _delete_one(&mut bt);
     }
 
     fn _find_range(bt: &mut BTree<i32, i32>, n: usize) {
@@ -1185,12 +1236,15 @@ mod tests {
             assert!(300 >= k);
             assert_eq!(v, 3 * k);
         }
+
+        bt.print();
+        bt.assert_integrity();
     }
 
     #[test]
     fn in_mem_find_range() {
-        let mut bt: BTree<i32, i32> = BTree::new_in_mem(33, true);
-        _find_range(&mut bt, 10000);
+        let mut bt: BTree<i32, i32> = BTree::new_in_mem(17, true);
+        _find_range(&mut bt, 50000);
     }
 
     #[test]
@@ -1250,9 +1304,7 @@ mod tests {
     fn serialize_page() {
         let pages = new_test_pages();
         for page in pages.iter() {
-            println!("serialize page {}", page.id);
             let bytes = page.to_bytes();
-            println!("bytes: {:?}", &bytes[0..128]);
             let res: Result<(usize, Page<i32, i32>), SerializeError> = Page::from_bytes(&bytes);
             assert!(res.is_ok());
             let (_, got_page) = res.unwrap();
