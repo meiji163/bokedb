@@ -37,19 +37,6 @@ pub mod btree {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct PageNotFoundError;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct CommitError {
-        message: String,
-    }
-
-    impl CommitError {
-        fn new(msg: &str) -> Self {
-            CommitError {
-                message: msg.to_string(),
-            }
-        }
-    }
-
     impl fmt::Display for KeyNotFoundError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "key not found")
@@ -68,14 +55,6 @@ pub mod btree {
         }
     }
 
-    impl fmt::Display for CommitError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", self.message)
-        }
-    }
-
-    impl std::error::Error for CommitError {}
-
     // ===================== BTree Pages =====================
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub enum PageType {
@@ -84,7 +63,7 @@ pub mod btree {
     }
 
     /// Size in bytes of each BTree page.
-    pub const PAGE_SIZE: usize = 1024 * 8;
+    pub const PAGE_SIZE: usize = 1024 * 16;
 
     /// Page is a BTree page, which can hold keys or key-vals
     #[derive(Debug, Clone)]
@@ -107,37 +86,49 @@ pub mod btree {
     pub trait Pager<K: Key, V: Val>: fmt::Debug {
         fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError>;
         fn write_page(&mut self, page: &Page<K, V>) -> std::io::Result<()>;
-        fn commit(&mut self); //-> Result<u32, CommitError>;
+        fn commit(&mut self) -> std::io::Result<()>;
     }
 
     /// MemPager is a simple in-memory page store.
     #[derive(Debug)]
     pub struct MemPager<K: Key, V: Val> {
         pages: Vec<Page<K, V>>,
+        wal: Vec<Page<K, V>>,
     }
 
     impl<K: Key, V: Val> Pager<K, V> for MemPager<K, V> {
         fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError> {
+            for p in self.wal.iter().rev() {
+                if p.id == id {
+                    return Ok(p);
+                }
+            }
             let res = self.pages.binary_search_by_key(&id, |p| p.id);
             match res {
                 Ok(idx) => Ok(&self.pages[idx]),
                 Err(_) => Err(PageNotFoundError),
             }
         }
+
         fn write_page(&mut self, page: &Page<K, V>) -> std::io::Result<()> {
-            let res = self.pages.binary_search_by_key(&page.id, |p| p.id);
-            match res {
-                Ok(idx) => {
-                    self.pages[idx] = page.clone();
-                }
-                Err(idx) => {
-                    self.pages.insert(idx, page.clone());
-                }
-            }
+            self.wal.push(page.clone());
             Ok(())
         }
-        fn commit(&mut self) {
-            // TODO
+
+        fn commit(&mut self) -> std::io::Result<()> {
+            for page in self.wal.iter() {
+                let res = self.pages.binary_search_by_key(&page.id, |p| p.id);
+                match res {
+                    Ok(idx) => {
+                        self.pages[idx] = page.clone();
+                    }
+                    Err(idx) => {
+                        self.pages.insert(idx, page.clone());
+                    }
+                }
+            }
+            self.wal.clear();
+            Ok(())
         }
     }
 
@@ -145,19 +136,26 @@ pub mod btree {
     /// It maintains an index that maps page IDs to the byte offset.
     #[derive(Debug)]
     pub struct FilePager<K: Key, V: Val> {
-        /// Pairs of (`id`, `index`), where `index` is the index of page `id` in the file.
+        /// Pairs of (`id`, `idx`), where `idx` is the index of page where id=`id` in the file.
         p_index: Vec<(u32, u32)>,
         /// The next page index to be assigned.
         next_index: u32,
         /// Global byte offset in the file.
         global_offset: u64,
-        file: File,
+        pub file: File,
         /// Cache stores pages read from disk.
         cache: Vec<Page<K, V>>,
+        wal: Vec<Page<K, V>>,
     }
 
     impl<K: Key, V: Val> Pager<K, V> for FilePager<K, V> {
         fn read_page(&mut self, id: u32) -> Result<&Page<K, V>, PageNotFoundError> {
+            for p in self.wal.iter().rev() {
+                if p.id == id {
+                    return Ok(p);
+                }
+            }
+
             // check cache
             let cached = self.cache.binary_search_by_key(&id, |p| p.id);
             if let Ok(idx) = cached {
@@ -184,42 +182,44 @@ pub mod btree {
         }
 
         fn write_page(&mut self, page: &Page<K, V>) -> std::io::Result<()> {
-            let id = page.id;
-            let res = self.p_index.binary_search_by_key(&id, |&(p, _)| p);
-            let buf = page.to_bytes();
-            match res {
-                Ok(idx) => {
-                    // update page
-                    let ofs = (PAGE_INDEX_SIZE as u64) * (self.p_index[idx].1 as u64);
-                    self.file.seek(SeekFrom::Start(ofs + self.global_offset))?;
-                    self.file.write_all(&buf)?;
-                }
-                Err(idx) => {
-                    // create page
-                    let ofs = (PAGE_INDEX_SIZE as u64) * (self.next_index as u64);
-                    self.file.seek(SeekFrom::Start(ofs + self.global_offset))?;
-                    self.file.write_all(&buf)?;
-                    self.p_index.insert(idx, (id, self.next_index));
-                    self.next_index += 1;
-
-                    self.write_index()?;
-                }
-            }
-            // update cache
-            match self.cache.binary_search_by_key(&id, |p| p.id) {
-                Ok(i) => {
-                    self.cache[i] = page.clone();
-                }
-                Err(i) => {
-                    self.cache.insert(i, page.clone());
-                }
-            }
-
+            self.wal.push(page.clone());
             Ok(())
-            //self.file.flush()
         }
 
-        fn commit(&mut self) {}
+        fn commit(&mut self) -> std::io::Result<()> {
+            for page in self.wal.iter() {
+                let id = page.id;
+                let res = self.p_index.binary_search_by_key(&id, |&(p, _)| p);
+                let buf = page.to_bytes();
+                match res {
+                    Ok(idx) => {
+                        // update page
+                        let ofs = (PAGE_INDEX_SIZE as u64) * (self.p_index[idx].1 as u64);
+                        self.file.seek(SeekFrom::Start(ofs + self.global_offset))?;
+                        self.file.write_all(&buf)?;
+                    }
+                    Err(idx) => {
+                        // create page
+                        let ofs = (PAGE_INDEX_SIZE as u64) * (self.next_index as u64);
+                        self.file.seek(SeekFrom::Start(ofs + self.global_offset))?;
+                        self.file.write_all(&buf)?;
+                        self.p_index.insert(idx, (id, self.next_index));
+                        self.next_index += 1;
+                    }
+                }
+                // update cache
+                match self.cache.binary_search_by_key(&id, |p| p.id) {
+                    Ok(i) => {
+                        self.cache[i] = page.clone();
+                    }
+                    Err(i) => {
+                        self.cache.insert(i, page.clone());
+                    }
+                }
+            }
+            self.wal.clear();
+            self.write_index()
+        }
     }
 
     // TODO: the page index should grow as needed.
@@ -274,6 +274,7 @@ pub mod btree {
                 next_index: 1,
                 p_index: vec![],
                 cache: vec![],
+                wal: vec![],
                 file: file,
                 global_offset: 0,
             }
@@ -504,6 +505,7 @@ pub mod btree {
                     ptype: PageType::Leaf,
                     sibling: None,
                 }],
+                wal: vec![],
             });
 
             BTree {
@@ -690,7 +692,6 @@ pub mod btree {
                 Ok(())
             } else {
                 let mut par_id_opt = visited.pop();
-                // println!("needs split: id={} sib={:?} par={:?}", page.id, page.sibling, par_id_opt);
                 // try to overflow to sibling first
                 if page.sibling.is_some() && par_id_opt.is_some() {
                     let par_id = par_id_opt.unwrap();
@@ -974,6 +975,7 @@ mod tests {
             sibling: None,
         };
         pager.write_page(&root).unwrap();
+        pager.commit().unwrap();
 
         pager
     }
@@ -1025,6 +1027,8 @@ mod tests {
             let err = bt.insert(k, v);
             assert!(err.is_ok());
         }
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
         assert_eq!(bt.find(&5), Some(50));
         assert_eq!(bt.find(&6), Some(60));
         assert_eq!(bt.find(&8), Some(80));
@@ -1054,6 +1058,9 @@ mod tests {
         assert_eq!(bt.insert(0, 0), Ok(()));
         assert_eq!(bt.insert(-1, -2), Ok(()));
 
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
+
         let p0 = bt.pager.read_page(0).unwrap();
         assert_eq!(p0.keys, vec![1]);
         let p1 = bt.pager.read_page(1).unwrap();
@@ -1071,6 +1078,9 @@ mod tests {
             let err = bt.insert(k, v);
             assert!(err.is_ok());
         }
+
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
 
         assert_eq!(bt.find(&5), Some(55));
         assert_eq!(bt.find(&6), Some(66));
@@ -1111,6 +1121,9 @@ mod tests {
             let err = bt.insert(k, val);
             assert!(err.is_ok());
         }
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
+
         for (k, v) in keys.iter().zip(vals) {
             assert_eq!(bt.find(k), Some(v));
         }
@@ -1120,15 +1133,14 @@ mod tests {
     fn in_mem_insert_rand() {
         let mut rng = StdRng::seed_from_u64(RNG_SEED);
         //let sizes = [21, 101, 179, 213, 303];
-        let sizes = [21];
+        let sizes = [21, 101, 179];
         for size in sizes.into_iter() {
             println!("size={}", size);
             let mut bt: BTree<i32, i32> = BTree::new_in_mem(size, true);
-            _insert_rand(&mut rng, &mut bt, 1000);
+            _insert_rand(&mut rng, &mut bt, 10000);
             bt.print();
             bt.assert_integrity();
         }
-        //assert!(false);
     }
 
     #[test]
@@ -1159,10 +1171,15 @@ mod tests {
             let err = bt.insert(k, val);
             assert!(err.is_ok());
         }
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
+
         for k in keys[n / 2..].iter() {
             let err = bt.delete(k);
             assert!(err.is_ok());
         }
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
         for (i, k) in keys[0..n / 2].iter().enumerate() {
             assert_eq!(bt.find(k), Some(vals[i]));
         }
@@ -1197,6 +1214,8 @@ mod tests {
             let err = bt.insert(k, v);
             assert!(err.is_ok());
         }
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
 
         assert_eq!(bt.find(&5), Some(55));
         let err = bt.delete(&5);
@@ -1223,6 +1242,8 @@ mod tests {
             let err = bt.insert(i as i32, 3 * i as i32);
             assert!(err.is_ok());
         }
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
 
         let min = 51;
         let max = 300;
@@ -1243,7 +1264,7 @@ mod tests {
 
     #[test]
     fn in_mem_find_range() {
-        let mut bt: BTree<i32, i32> = BTree::new_in_mem(17, true);
+        let mut bt: BTree<i32, i32> = BTree::new_in_mem(23, true);
         _find_range(&mut bt, 50000);
     }
 
@@ -1262,6 +1283,9 @@ mod tests {
         assert!(bt.insert(1, 11).is_ok());
 
         assert!(bt.insert(5, 55).is_ok());
+        let res = bt.pager.commit();
+        assert!(res.is_ok());
+
         let err = bt.insert(5, 555);
         assert_eq!(err, Err(DuplicateKeyError));
 
@@ -1326,6 +1350,8 @@ mod tests {
         for p in pages.iter() {
             assert!(pager.write_page(p).is_ok());
         }
+        let res = pager.commit();
+        assert!(res.is_ok());
 
         let res = pager.read_index();
         assert!(res.is_ok());
